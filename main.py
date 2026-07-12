@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 import subprocess
 import shutil
 import re
@@ -15,11 +16,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from openpyxl import load_workbook
 
 APP_NAME = "Horizon Chantier"
+_DOSSIER_BASE_MEMOIRE: Path | None = None
 
 # =========================
 # FICHIERS (STRICT / SANS REFONTE)
@@ -34,6 +36,8 @@ FICHIER_PV = PV_SOURCE
 # AppleScript helpers (Excel ouvert)
 # =========================
 def _osascript(script: str) -> str:
+    if sys.platform != "darwin":
+        raise RuntimeError("Cette commande d'automatisation Excel est disponible uniquement sur macOS.")
     p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or "Erreur AppleScript")
@@ -86,6 +90,23 @@ def excel_find_first_empty_cell(workbook_hint: str, sheet_name: str, cell_range:
     """
     hint = (workbook_hint or "").strip()
     if not hint:
+        return ""
+
+    if sys.platform != "darwin":
+        try:
+            import xlwings as xw
+            for app in xw.apps:
+                for livre in app.books:
+                    if hint.casefold() not in livre.name.casefold():
+                        continue
+                    feuille = livre.sheets[sheet_name]
+                    for cellule in feuille.range(cell_range):
+                        formule = cellule.formula
+                        valeur = cellule.value
+                        if not formule and valeur in (None, ""):
+                            return cellule.address.replace("$", "")
+        except Exception:
+            return ""
         return ""
 
     for _ in range(8):
@@ -162,6 +183,25 @@ def excel_set_cell_value(workbook_hint: str, sheet_name: str, cell_a1: str, valu
     hint = (workbook_hint or "").strip()
     if not hint:
         raise ValueError("Nom de classeur vide")
+
+    if sys.platform != "darwin":
+        try:
+            import xlwings as xw
+            for app in xw.apps:
+                for livre in app.books:
+                    if hint.casefold() not in livre.name.casefold():
+                        continue
+                    cellule = livre.sheets[sheet_name].range(cell_a1)
+                    if cellule.formula:
+                        raise ValueError("Cellule formule protégée")
+                    cellule.value = value
+                    livre.activate()
+                    return
+        except ValueError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Impossible de communiquer avec Microsoft Excel : {e}") from e
+        raise RuntimeError("Le classeur Excel ouvert est introuvable")
 
     safe_val = (value or "").replace('"', '\\"')
 
@@ -636,7 +676,7 @@ def open_pr(chantier_dir: str | Path):
     pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     if not pr.exists():
         raise FileNotFoundError(f"PR introuvable : {pr}")
-    subprocess.run(["open", str(pr)], check=False)
+    ouvrir_chemin(pr)
 
 
 def inject_pv(chantier_dir: str | Path) -> int:
@@ -757,11 +797,58 @@ def sync_pv_to_copies(chantier_dir: str | Path) -> None:
 # Dossiers (auto Chantier/Chantiers)
 # ---------------------------
 def dossier_base() -> Path:
-    return Path.home() / "Desktop" / "Horizon_Chantier_Data"
+    global _DOSSIER_BASE_MEMOIRE
+    if _DOSSIER_BASE_MEMOIRE is not None:
+        return _DOSSIER_BASE_MEMOIRE
+
+    chemin_impose = os.environ.get("HORIZON_CHANTIER_DATA")
+    if chemin_impose:
+        _DOSSIER_BASE_MEMOIRE = Path(chemin_impose).expanduser().resolve()
+        return _DOSSIER_BASE_MEMOIRE
+
+    if os.name == "nt":
+        racine_config = Path(os.environ.get("APPDATA", Path.home()))
+    elif sys.platform == "darwin":
+        racine_config = Path.home() / "Library" / "Application Support"
+    else:
+        racine_config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    fichier_config = racine_config / "HorizonChantier" / "config.json"
+
+    try:
+        configuration = json.loads(fichier_config.read_text(encoding="utf-8"))
+        chemin_configure = Path(str(configuration.get("dossier_donnees", ""))).expanduser()
+        if chemin_configure.is_dir():
+            _DOSSIER_BASE_MEMOIRE = chemin_configure.resolve()
+            return _DOSSIER_BASE_MEMOIRE
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+    selection = filedialog.askdirectory(
+        title="Choisir le dossier de données Horizon Chantier",
+        mustexist=True,
+    )
+    if not selection:
+        raise RuntimeError("Aucun dossier de données Horizon Chantier n'a été choisi.")
+
+    _DOSSIER_BASE_MEMOIRE = Path(selection).resolve()
+    try:
+        fichier_config.parent.mkdir(parents=True, exist_ok=True)
+        fichier_config.write_text(
+            json.dumps({"dossier_donnees": str(_DOSSIER_BASE_MEMOIRE)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        messagebox.showwarning(
+            "Configuration",
+            f"Le dossier fonctionne, mais son emplacement n'a pas pu être mémorisé.\n{e}",
+        )
+    return _DOSSIER_BASE_MEMOIRE
 
 
 def dossier_chantiers() -> Path:
     base = dossier_base()
+    if base.name.casefold() in {"chantier", "chantiers"}:
+        return base
     d1 = base / "Chantier"
     d2 = base / "Chantiers"
     if d1.exists():
@@ -828,18 +915,25 @@ def ouvrir_doc(self, nom_fichier):
     if not self._preparer_ouverture_document(chemin):
         return
 
-    if sys.platform == "darwin":
-        subprocess.run(["open", str(chemin)], check=False)
-    elif os.name == "nt":
-        os.startfile(str(chemin))
+    ouvrir_chemin(chemin)
     if self._doit_rappeler_pdf_historique(chemin):
         self._planifier_rappel_pdf_historique_ouverture()
 
-def ouvrir_dossier(path: Path) -> None:
+def ouvrir_chemin(path: str | Path) -> None:
+    chemin = Path(path)
     try:
-        subprocess.run(["open", str(path)], check=False)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(chemin)])
+        elif os.name == "nt":
+            os.startfile(str(chemin))
+        else:
+            subprocess.Popen(["xdg-open", str(chemin)])
     except Exception as e:
-        messagebox.showerror("Erreur", f"Impossible d'ouvrir le dossier.\n{e}")
+        messagebox.showerror("Erreur", f"Impossible d'ouvrir le fichier ou le dossier.\n{e}")
+
+
+def ouvrir_dossier(path: Path) -> None:
+    ouvrir_chemin(path)
 
 
 # ---------------------------
@@ -961,7 +1055,7 @@ class HorizonChantierApp(tk.Tk):
             return
         if not self._preparer_ouverture_document(chemin):
             return
-        subprocess.Popen(["open", str(chemin)])
+        ouvrir_chemin(chemin)
         if self._doit_rappeler_pdf_historique(chemin):
             self._planifier_rappel_pdf_historique_ouverture()
 
@@ -976,7 +1070,7 @@ class HorizonChantierApp(tk.Tk):
             return
         if not self._preparer_ouverture_document(chemin):
             return
-        subprocess.Popen(["open", chemin.as_posix()])
+        ouvrir_chemin(chemin)
         if self._doit_rappeler_pdf_historique(chemin):
             self._planifier_rappel_pdf_historique_ouverture()
 
@@ -1204,7 +1298,8 @@ class HorizonChantierApp(tk.Tk):
                 "Vous allez clôturer l'État d'avancement.\n\n"
                 "Cette opération effectue la mise à zéro des quantités du mois "
                 "et il sera impossible de revenir à l'état précédent.\n\n"
-                "Avez-vous créé votre PDF Historique de sauvegarde ?"
+                "Une copie datée de l'état sera enregistrée automatiquement "
+                "dans le dossier Sauvegarde avant la clôture."
             ),
             font=("Helvetica", 13, "bold"),
             wraplength=590,
@@ -1226,7 +1321,7 @@ class HorizonChantierApp(tk.Tk):
         bouton_annuler.pack(side="left")
         ttk.Button(
             boutons,
-            text="✅ Oui, j'ai créé mon PDF Historique et je confirme la clôture",
+            text="✅ Oui, je confirme la clôture",
             command=confirmer,
         ).pack(side="right", padx=(20, 0))
 
@@ -1310,6 +1405,7 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(frame_gauche, text="📄 Ouvrir dans le logiciel", command=self.ouvrir_chantier).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="➕ Nouveau chantier", command=self.nouveau_chantier).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="✏️ Modifier", command=self.modifier_chantier).pack(fill="x", pady=3)
+        ttk.Button(frame_gauche, text="👥 Voir les clients", command=self.voir_clients).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="🗑️ Supprimer", command=self.supprimer_chantier).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="🔄 Rafraîchir", command=self.refresh_liste).pack(fill="x", pady=3)
         tk.Button(
@@ -2146,76 +2242,45 @@ class HorizonChantierApp(tk.Tk):
         if not self._confirmer_cloture_etat():
             return
 
-        nom_chantier = self._nom_chantier_selectionne()
-        if not nom_chantier:
+        p = self._chemin_chantier_selectionne()
+        if not p:
+            messagebox.showwarning("Clôturer état", "Sélectionne un chantier dans la liste.")
             return
-        chemin = next(
-            Path(
-                dossier_chantiers() / nom_chantier
-            ).glob("Etat_avancement*.xlsm")
-        ).as_posix()
-
-        feuille = "Bordereau"
-
-        _backup_excel_before_write(chemin)
-        wb = load_workbook(chemin, keep_vba=True)
-        ws = wb[feuille]
-
-        def normaliser_libelle(valeur):
-            texte = str(valeur or "").strip().lower()
-            texte = texte.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
-            texte = texte.replace("à", "a").replace("â", "a").replace("ä", "a")
-            texte = texte.replace("ù", "u").replace("û", "u").replace("ü", "u")
-            texte = texte.replace("î", "i").replace("ï", "i")
-            texte = texte.replace("ô", "o").replace("ö", "o")
-            texte = texte.replace("ç", "c")
-            texte = texte.replace("\n", " ")
-            texte = re.sub(r"\s+", " ", texte)
-            return texte
-
-        libelles_synthese = (
-            "total soumission hors tva",
-            "total etat cumule hors tva",
-            "total du mois hors tva",
-            "total des avenants cumule",
-            "montant global a facturer",
-            "total execute",
-        )
-
-        def est_ligne_synthese(ligne):
-            contenu = " ".join(
-                normaliser_libelle(ws.cell(ligne, col).value)
-                for col in range(1, ws.max_column + 1)
+        dossier = self._dossier_depuis_json(p)
+        try:
+            chemin = next(dossier.glob("Etat_avancement*.xlsm"))
+        except StopIteration:
+            messagebox.showerror(
+                "Clôturer état",
+                "Aucun fichier Etat_avancement*.xlsm dans le dossier du chantier.",
             )
-            return any(libelle in contenu for libelle in libelles_synthese)
+            return
 
-        def premiere_ligne_synthese():
+        dossier_sauvegarde = chemin.parent / "Sauvegarde"
+        horodatage = time.strftime("%Y-%m-%d_%H-%M-%S")
+        copie_datee = dossier_sauvegarde / f"{chemin.stem}_{horodatage}{chemin.suffix}"
+        try:
+            dossier_sauvegarde.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(chemin, copie_datee)
+        except Exception as e:
+            messagebox.showerror(
+                "Clôturer état",
+                f"La sauvegarde avant clôture a échoué.\nLa clôture est annulée.\n{e}",
+            )
+            return
+
+        try:
+            wb = load_workbook(chemin, keep_vba=True)
+            ws = wb["Bordereau"]
             for ligne in range(24, ws.max_row + 1):
-                if est_ligne_synthese(ligne):
-                    return ligne
-            return ws.max_row + 1
+                ws[f"P{ligne}"] = ws[f"R{ligne}"].value
+                ws[f"Q{ligne}"] = 0
+            wb.save(chemin)
+            wb.close()
+        except Exception as e:
+            messagebox.showerror("Clôturer état", f"La clôture a échoué.\n{e}")
+            return
 
-        def ligne_bordereau_a_cloturer(ligne):
-            valeurs = [
-                ws[f"B{ligne}"].value,
-                ws[f"C{ligne}"].value,
-                ws[f"J{ligne}"].value,
-                ws[f"L{ligne}"].value,
-                ws[f"P{ligne}"].value,
-                ws[f"Q{ligne}"].value,
-            ]
-            return any(v not in (None, "", "-", "—") for v in valeurs)
-
-        fin_bordereau = premiere_ligne_synthese() - 1
-
-        for ligne in range(24, fin_bordereau + 1):
-            if not ligne_bordereau_a_cloturer(ligne):
-                continue
-            ws[f"P{ligne}"] = ws[f"R{ligne}"].value
-            ws[f"Q{ligne}"] = 0
-
-        _protect_formula_cells(wb, chemin)
-        wb.save(chemin)
         self.calcul_etat_avancement()
         print("Clôture état effectuée")
 
@@ -2911,7 +2976,7 @@ class HorizonChantierApp(tk.Tk):
             except:
                 pass
 
-        subprocess.run(["open", pdf_path])
+        ouvrir_chemin(pdf_path)
 
         
         messagebox.showinfo("Pilotage chantier", texte_popup)
@@ -3445,7 +3510,7 @@ class HorizonChantierApp(tk.Tk):
                 except:
                     pass
 
-            subprocess.run(["open", pdf_path])
+            ouvrir_chemin(pdf_path)
 
         except Exception as e:
             if 'graphique_tmp' in locals() and graphique_tmp and os.path.exists(graphique_tmp):
@@ -3974,7 +4039,7 @@ class HorizonChantierApp(tk.Tk):
                 except:
                     pass
 
-            subprocess.run(["open", pdf_path])
+            ouvrir_chemin(pdf_path)
 
         except Exception as e:
             if 'graphique_tmp' in locals() and graphique_tmp and os.path.exists(graphique_tmp):
@@ -4027,6 +4092,132 @@ class HorizonChantierApp(tk.Tk):
                 "Fichier chantier illisible :\n" + "\n".join(fichiers_illisibles)
             )
 
+    def voir_clients(self) -> None:
+        clients = {}
+        for chemin in sorted(dossier_chantiers().glob("*.json")):
+            try:
+                donnees = lire_json(chemin)
+                info = infos_chantier(donnees)
+                nom_client = str(info.get("client", "") or "").strip()
+                if not nom_client:
+                    continue
+                entree = clients.setdefault(
+                    nom_client.casefold(),
+                    {"nom": nom_client, "chantiers": [], "chemins": [], "donnees": []},
+                )
+                entree["chantiers"].append(str(info.get("nom", "") or chemin.stem))
+                entree["chemins"].append(chemin)
+                entree["donnees"].append(donnees)
+            except Exception:
+                continue
+
+        win = tk.Toplevel(self)
+        win.title("Clients")
+        win.geometry("850x520")
+        win.minsize(650, 350)
+        win.transient(self)
+
+        cadre = ttk.Frame(win, padding=12)
+        cadre.pack(fill="both", expand=True)
+        ttk.Label(
+            cadre,
+            text=f"Clients enregistrés : {len(clients)}",
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        zone_liste = ttk.Frame(cadre)
+        zone_liste.pack(fill="both", expand=True)
+        colonnes = ("Client", "Nombre", "Chantiers")
+        liste = ttk.Treeview(zone_liste, columns=colonnes, show="headings")
+        for colonne in colonnes:
+            liste.heading(colonne, text=colonne)
+        liste.column("Client", width=220, anchor="w")
+        liste.column("Nombre", width=75, anchor="center", stretch=False)
+        liste.column("Chantiers", width=480, anchor="w")
+        clients_par_chemin = {}
+
+        def entree_selectionnee():
+            selection = liste.selection()
+            if not selection:
+                messagebox.showinfo("Clients", "Sélectionnez un client.", parent=win)
+                return None
+            return clients_par_chemin.get(selection[0])
+
+        def selectionner_chantier():
+            entree = entree_selectionnee()
+            if not entree:
+                return
+            chemin = entree["chemins"][0]
+            if self.tree.exists(str(chemin)):
+                self.tree.selection_set(str(chemin))
+                self.tree.focus(str(chemin))
+                self.tree.see(str(chemin))
+            win.destroy()
+
+        def afficher_fiche(_evenement=None):
+            entree = entree_selectionnee()
+            if not entree:
+                return
+            fiche = tk.Toplevel(win)
+            fiche.title(f"Fiche client — {entree['nom']}")
+            fiche.geometry("780x500")
+            fiche.minsize(650, 400)
+            fiche.transient(win)
+            contenu = ttk.Frame(fiche, padding=14)
+            contenu.pack(fill="both", expand=True)
+            ttk.Label(contenu, text=entree["nom"], font=("Helvetica", 18, "bold")).pack(
+                anchor="w", pady=(0, 12)
+            )
+            onglets = ttk.Notebook(contenu)
+            onglets.pack(fill="both", expand=True)
+            libelles = (
+                ("client", "Client"),
+                ("personne_contact", "Personne de contact"),
+                ("telephone", "Téléphone"),
+                ("email", "E-mail"),
+                ("adresse", "Adresse"),
+                ("chantier", "Chantier"),
+                ("type_etat", "Type d'état"),
+                ("etat", "État"),
+                ("avancement", "Avancement"),
+            )
+            for index, donnees in enumerate(entree["donnees"]):
+                nom_chantier = str(donnees.get("chantier", "") or entree["chantiers"][index])
+                page = ttk.Frame(onglets, padding=12)
+                onglets.add(page, text=nom_chantier)
+                page.columnconfigure(1, weight=1)
+                for ligne, (cle, libelle) in enumerate(libelles):
+                    valeur = donnees.get(cle, "")
+                    if cle == "avancement" and valeur != "":
+                        valeur = f"{valeur} %"
+                    ttk.Label(page, text=f"{libelle} :", font=("Helvetica", 11, "bold")).grid(
+                        row=ligne, column=0, sticky="nw", padx=(0, 12), pady=4
+                    )
+                    ttk.Label(page, text=str(valeur or "—"), wraplength=510).grid(
+                        row=ligne, column=1, sticky="nw", pady=4
+                    )
+            ttk.Button(contenu, text="Fermer", command=fiche.destroy).pack(anchor="e", pady=(10, 0))
+
+        for entree in sorted(clients.values(), key=lambda item: item["nom"].casefold()):
+            premier_chemin = entree["chemins"][0]
+            clients_par_chemin[str(premier_chemin)] = entree
+            liste.insert(
+                "", "end", iid=str(premier_chemin),
+                values=(entree["nom"], len(entree["chantiers"]), ", ".join(entree["chantiers"])),
+            )
+
+        defilement = ttk.Scrollbar(zone_liste, orient="vertical", command=liste.yview)
+        liste.configure(yscrollcommand=defilement.set)
+        liste.pack(side="left", fill="both", expand=True)
+        defilement.pack(side="right", fill="y")
+        liste.bind("<Double-1>", afficher_fiche)
+        bas = ttk.Frame(cadre)
+        bas.pack(fill="x", pady=(10, 0))
+        ttk.Label(bas, text="Double-cliquez sur un client pour ouvrir sa fiche complète.").pack(side="left")
+        ttk.Button(bas, text="Fermer", command=win.destroy).pack(side="right")
+        ttk.Button(bas, text="Voir la fiche complète", command=afficher_fiche).pack(side="right", padx=(0, 8))
+        ttk.Button(bas, text="Sélectionner le chantier", command=selectionner_chantier).pack(side="right", padx=(0, 8))
+
     def _pr_path_and_hint(self) -> tuple[Path, str]:
         p = self._chemin_chantier_selectionne()
         if not p:
@@ -4064,7 +4255,7 @@ class HorizonChantierApp(tk.Tk):
             if not self._preparer_ouverture_document(pr_path):
                 return
             _prepare_excel_file_before_write(pr_path)
-            subprocess.run(["open", str(pr_path)], check=False)
+            ouvrir_chemin(pr_path)
             self._planifier_rappel_pdf_historique_ouverture()
             time.sleep(0.3)
 
@@ -4088,7 +4279,7 @@ class HorizonChantierApp(tk.Tk):
             if not self._preparer_ouverture_document(pr_path):
                 return
             _prepare_excel_file_before_write(pr_path)
-            subprocess.run(["open", str(pr_path)], check=False)
+            ouvrir_chemin(pr_path)
             self._planifier_rappel_pdf_historique_ouverture()
             time.sleep(0.3)
 
@@ -4270,14 +4461,35 @@ class HorizonChantierApp(tk.Tk):
         if not p:
             messagebox.showwarning("Chantier", "Sélectionne un chantier dans la liste.")
             return
+
+        dossier = self._dossier_depuis_json(p)
+        numero = re.match(r"^(\d+)", dossier.name)
+        if not numero:
+            messagebox.showerror(
+                "Bordereau introuvable",
+                "Le nom du chantier doit commencer par son numéro "
+                "(exemple : 002_Saint-Symphorien).",
+            )
+            return
+
+        nom_attendu = f"Bordereau_{numero.group(1)}.PDF"
         try:
-            chantier = lire_json(p)
-            if chantier.get("bordereau", {}).get("articles"):
-                afficher_bordereau(self, chantier, "Bordereau (JSON)")
-            else:
-                messagebox.showinfo("Chantier", "Chantier ouvert. (Pas encore de bordereau dans ce chantier.)")
+            bordereau_pdf = next(
+                fichier
+                for fichier in dossier.iterdir()
+                if fichier.is_file() and fichier.name.lower() == nom_attendu.lower()
+            )
+        except (FileNotFoundError, StopIteration):
+            messagebox.showerror(
+                "Bordereau introuvable",
+                f"Fichier absent dans le dossier du chantier :\n{nom_attendu}",
+            )
+            return
+
+        try:
+            ouvrir_chemin(bordereau_pdf)
         except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible d'ouvrir le chantier.\n{e}")
+            messagebox.showerror("Erreur", f"Impossible d'ouvrir le bordereau PDF.\n{e}")
 
     def dossier_du_chantier(self) -> None:
         p = self._chemin_chantier_selectionne()
@@ -4351,6 +4563,7 @@ class HorizonChantierApp(tk.Tk):
                 "chantier": nom_chantier,
                 "client": nom_client,
                 "adresse": adresse_chantier,
+                "type_etat": type_etat_var.get(),
                 "etat": "Devis",
                 "avancement": 0,
                 "bordereau": {"source": {}, "articles": {}},
@@ -4408,7 +4621,122 @@ class HorizonChantierApp(tk.Tk):
 
 
     def modifier_chantier(self) -> None:
-        messagebox.showinfo("Info", "Modifier chantier (à brancher)")
+        json_path = self._chemin_chantier_selectionne()
+        if not json_path:
+            messagebox.showwarning("Modifier chantier", "Sélectionne un chantier dans la liste.")
+            return
+        try:
+            chantier = lire_json(json_path)
+        except Exception as e:
+            messagebox.showerror("Modifier chantier", f"Impossible de lire le chantier.\n{e}")
+            return
+
+        infos = infos_chantier(chantier)
+        win = tk.Toplevel(self)
+        win.title("Modifier chantier")
+        win.geometry("820x410")
+        win.resizable(False, False)
+        win.transient(self)
+        frame = ttk.Frame(win, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        champs = (
+            ("Nom du client", infos["client"]),
+            ("Nom du chantier", infos["nom"]),
+            ("Adresse", chantier.get("adresse", "")),
+            ("Personne de contact", chantier.get("personne_contact", "")),
+            ("Téléphone", chantier.get("telephone", "")),
+            ("E-mail", chantier.get("email", "")),
+        )
+        entrees = []
+        for index, (libelle, valeur) in enumerate(champs):
+            ligne = index * 2
+            ttk.Label(frame, text=libelle).grid(row=ligne, column=0, sticky="w")
+            entree = ttk.Entry(frame, width=90)
+            entree.grid(row=ligne + 1, column=0, columnspan=2, sticky="ew", pady=(2, 8 if index < 5 else 12))
+            entree.insert(0, str(valeur or ""))
+            entrees.append(entree)
+
+        def valider():
+            nom_client, nom_chantier, adresse, personne_contact, telephone, email = (
+                entree.get().strip() for entree in entrees
+            )
+            if not nom_chantier:
+                messagebox.showwarning("Modifier chantier", "Renseigne le nom du chantier.", parent=win)
+                return
+
+            nouveau_nom_fichier = nom_chantier.replace("/", "_").replace("\\", "_")
+            nouveau_json_path = json_path.parent / f"{nouveau_nom_fichier}.json"
+            ancien_dossier_path = self._dossier_depuis_json(json_path)
+            nouveau_dossier_path = json_path.parent / nouveau_nom_fichier
+
+            try:
+                if nouveau_json_path.exists() and os.path.samefile(json_path, nouveau_json_path):
+                    nouveau_json_path = json_path
+                if (ancien_dossier_path.exists() and nouveau_dossier_path.exists()
+                        and os.path.samefile(ancien_dossier_path, nouveau_dossier_path)):
+                    nouveau_dossier_path = ancien_dossier_path
+            except FileNotFoundError:
+                pass
+
+            if nouveau_json_path != json_path and nouveau_json_path.exists():
+                messagebox.showwarning("Modifier chantier", "Un chantier portant ce nom existe déjà.", parent=win)
+                return
+            if nouveau_dossier_path != ancien_dossier_path and nouveau_dossier_path.exists():
+                messagebox.showwarning("Modifier chantier", "Un dossier chantier portant ce nom existe déjà.", parent=win)
+                return
+
+            donnees_modifiees = dict(chantier)
+            if "nom" in donnees_modifiees:
+                donnees_modifiees["nom"] = nom_chantier
+            if "chantier" in donnees_modifiees or "nom" not in donnees_modifiees:
+                donnees_modifiees["chantier"] = nom_chantier
+            donnees_modifiees.update({
+                "client": nom_client,
+                "adresse": adresse,
+                "personne_contact": personne_contact,
+                "telephone": telephone,
+                "email": email,
+            })
+
+            dossier_renomme = False
+            json_renomme = False
+            try:
+                if ancien_dossier_path.exists() and nouveau_dossier_path != ancien_dossier_path:
+                    ancien_dossier_path.rename(nouveau_dossier_path)
+                    dossier_renomme = True
+                if nouveau_json_path != json_path:
+                    json_path.rename(nouveau_json_path)
+                    json_renomme = True
+                ecrire_json(nouveau_json_path, donnees_modifiees)
+            except Exception as e:
+                try:
+                    if json_renomme and nouveau_json_path.exists():
+                        nouveau_json_path.rename(json_path)
+                    if dossier_renomme and nouveau_dossier_path.exists():
+                        nouveau_dossier_path.rename(ancien_dossier_path)
+                except Exception:
+                    pass
+                messagebox.showerror("Modifier chantier", f"Impossible de modifier le chantier.\n{e}", parent=win)
+                return
+
+            self.nom_client = nom_client
+            self.nom_chantier = nom_chantier
+            self.refresh_liste()
+            if self.tree.exists(str(nouveau_json_path)):
+                self.tree.selection_set(str(nouveau_json_path))
+                self.tree.focus(str(nouveau_json_path))
+            win.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=12, column=0, columnspan=2, sticky="e")
+        ttk.Button(btns, text="Annuler", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Valider", command=valider).pack(side="right", padx=(0, 8))
+        entrees[0].focus_set()
+        win.grab_set()
 
 
     def supprimer_chantier(self) -> None:
