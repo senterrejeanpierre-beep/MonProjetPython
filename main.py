@@ -797,52 +797,7 @@ def sync_pv_to_copies(chantier_dir: str | Path) -> None:
 # Dossiers (auto Chantier/Chantiers)
 # ---------------------------
 def dossier_base() -> Path:
-    global _DOSSIER_BASE_MEMOIRE
-    if _DOSSIER_BASE_MEMOIRE is not None:
-        return _DOSSIER_BASE_MEMOIRE
-
-    chemin_impose = os.environ.get("HORIZON_CHANTIER_DATA")
-    if chemin_impose:
-        _DOSSIER_BASE_MEMOIRE = Path(chemin_impose).expanduser().resolve()
-        return _DOSSIER_BASE_MEMOIRE
-
-    if os.name == "nt":
-        racine_config = Path(os.environ.get("APPDATA", Path.home()))
-    elif sys.platform == "darwin":
-        racine_config = Path.home() / "Library" / "Application Support"
-    else:
-        racine_config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    fichier_config = racine_config / "HorizonChantier" / "config.json"
-
-    try:
-        configuration = json.loads(fichier_config.read_text(encoding="utf-8"))
-        chemin_configure = Path(str(configuration.get("dossier_donnees", ""))).expanduser()
-        if chemin_configure.is_dir():
-            _DOSSIER_BASE_MEMOIRE = chemin_configure.resolve()
-            return _DOSSIER_BASE_MEMOIRE
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
-
-    selection = filedialog.askdirectory(
-        title="Choisir le dossier de données Horizon Chantier",
-        mustexist=True,
-    )
-    if not selection:
-        raise RuntimeError("Aucun dossier de données Horizon Chantier n'a été choisi.")
-
-    _DOSSIER_BASE_MEMOIRE = Path(selection).resolve()
-    try:
-        fichier_config.parent.mkdir(parents=True, exist_ok=True)
-        fichier_config.write_text(
-            json.dumps({"dossier_donnees": str(_DOSSIER_BASE_MEMOIRE)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        messagebox.showwarning(
-            "Configuration",
-            f"Le dossier fonctionne, mais son emplacement n'a pas pu être mémorisé.\n{e}",
-        )
-    return _DOSSIER_BASE_MEMOIRE
+    return Path.home() / "Desktop" / "Horizon_Chantier_Data"
 
 
 def dossier_chantiers() -> Path:
