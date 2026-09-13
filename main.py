@@ -7,7 +7,9 @@ import subprocess
 import shutil
 import re
 import time
+import tempfile
 import unicodedata
+import math
 from copy import copy
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tkinter import ttk, messagebox, filedialog
 
 from openpyxl import load_workbook
+
+from bordereau_public import (feuille as _feuille_etat, est_metre as _est_metre_public,
+                               lignes_postes as _postes_publics, lire_config as _config_public,
+                               exporter_prix as _exporter_prix_public)
+
+from environnement_partage import trouver_base, memoriser_base
 
 APP_NAME = "Horizon Chantier"
 _DOSSIER_BASE_MEMOIRE: Path | None = None
@@ -103,7 +111,7 @@ def excel_find_first_empty_cell(workbook_hint: str, sheet_name: str, cell_range:
                     for cellule in feuille.range(cell_range):
                         formule = cellule.formula
                         valeur = cellule.value
-                        if not formule and valeur in (None, ""):
+                        if not (isinstance(formule, str) and formule.startswith("=")) and valeur in (None, ""):
                             return cellule.address.replace("$", "")
         except Exception:
             return ""
@@ -192,7 +200,7 @@ def excel_set_cell_value(workbook_hint: str, sheet_name: str, cell_a1: str, valu
                     if hint.casefold() not in livre.name.casefold():
                         continue
                     cellule = livre.sheets[sheet_name].range(cell_a1)
-                    if cellule.formula:
+                    if isinstance(cellule.formula, str) and cellule.formula.startswith("="):
                         raise ValueError("Cellule formule protégée")
                     cellule.value = value
                     livre.activate()
@@ -300,17 +308,11 @@ def _premiere_ligne_synthese_etat(ws) -> int:
         "total des avenants cumule",
         "montant global a facturer",
         "total execute",
-        "tva",
-        "revision",
-        "avenant",
     )
 
-    for ligne in range(24, ws.max_row + 1):
-        contenu = " ".join(
-            _normaliser_libelle_excel(ws.cell(ligne, col).value)
-            for col in range(1, ws.max_column + 1)
-        )
-        if any(libelle in contenu for libelle in libelles_synthese):
+    for ligne in range(2 if _est_metre_public(ws) else 24, ws.max_row + 1):
+        contenus = [_normaliser_libelle_excel(ws.cell(ligne, col).value) for col in range(16, 24)]
+        if any(contenu.startswith(libelle) for contenu in contenus for libelle in libelles_synthese):
             return ligne
 
     return ws.max_row + 1
@@ -318,6 +320,310 @@ def _premiere_ligne_synthese_etat(ws) -> int:
 
 def _montant_diminution_avenant(montant: float) -> float:
     return abs(montant)
+
+
+def _soumission_avant_cloture(chemin, convertir_nombre):
+    """Retrouve le total sauvegardé avant l'effacement du libellé en Q."""
+    chemin = Path(chemin)
+    sauvegardes = sorted(
+        (chemin.parent / "Sauvegarde").glob(f"{chemin.stem}_*{chemin.suffix}"),
+        key=lambda fichier: fichier.stat().st_mtime,
+        reverse=True,
+    )
+    for sauvegarde in sauvegardes:
+        wb = load_workbook(sauvegarde, data_only=True)
+        try:
+            if "Bordereau" not in wb.sheetnames:
+                continue
+            ws = _feuille_etat(wb)
+            for row in reversed(list(ws.iter_rows())):
+                for cellule in row:
+                    if _normaliser_libelle_excel(cellule.value) != "total soumission hors tva":
+                        continue
+                    valeur = ws.cell(cellule.row, cellule.column + 1).value
+                    if valeur is not None:
+                        return convertir_nombre(valeur)
+        finally:
+            wb.close()
+    return None
+
+
+def _reporter_quantites_cloture(ws):
+    # Une synthèse intermédiaire ne doit pas masquer les postes suivants.
+    reports = []
+    for ligne in (_postes_publics(ws) if _est_metre_public(ws) else range(24, ws.max_row + 1)):
+        if _ligne_synthese_etat(ws, ligne):
+            continue
+        valeurs = [ws[f"{col}{ligne}"].value for col in ("P", "Q", "R")]
+        if all(v in (None, "") for v in valeurs):
+            continue
+        # Les en-têtes textuels ne sont pas des quantités.
+        if not _article_pr(ws[f"B{ligne}"].value) and any(
+            isinstance(v, str) and v.strip() and not re.fullmatch(r"[-+\d.,\s]+", v)
+            for v in valeurs
+        ):
+            continue
+        cumul = _nombre_metier(valeurs[2], f"R{ligne}")
+        reports.append((ligne, cumul))
+    for ligne, cumul in reports:
+        ws[f"P{ligne}"] = cumul
+        ws[f"Q{ligne}"] = 0
+
+
+def _nombre_metier(valeur, cellule=""):
+    texte = re.sub(r"\s+", "", str(valeur if valeur is not None else ""))
+    texte = texte.replace("€", "").replace("−", "-").replace(",", ".")
+    if texte in ("", "-", "—"):
+        return 0.0
+    try:
+        resultat = float(texte)
+        if not math.isfinite(resultat):
+            raise ValueError
+        return resultat
+    except (TypeError, ValueError):
+        raise ValueError(f"Valeur numérique indisponible ou invalide en {cellule} : {valeur!r}. "
+                         "Vérifiez et enregistrez le classeur dans Excel.") from None
+
+
+def _article_pr(val):
+    if val is None:
+        return ""
+    txt = re.sub(r"\s+", "", str(val).strip().replace("\xa0", " ").replace(",", ".").lower())
+    parts = []
+    for part in txt.split("."):
+        if not part:
+            continue
+        match = re.fullmatch(r"(\d+)([a-z]+)?", part)
+        if match:
+            parts.append(str(int(match.group(1))) + (match.group(2) or ""))
+        else:
+            cleaned = re.sub(r"[^0-9a-z]+", "", part)
+            if cleaned:
+                parts.append(cleaned)
+    article = ".".join(parts)
+    return article if any(c.isdigit() for c in article) else ""
+
+
+def _ligne_synthese_etat(ws, ligne):
+    # Ne pas examiner les anciens états placés à droite du bordereau courant.
+    libelles = [ws[f"C{ligne}"].value] + [ws.cell(ligne, col).value for col in range(16, 24)]
+    return any(
+        _normaliser_libelle_excel(v).startswith(("total", "montant", "synthese", "sous-total"))
+        for v in libelles if isinstance(v, str) and not v.startswith("=")
+    )
+
+
+def _selectionner_etat(dossier):
+    dossier = Path(dossier)
+    configuration = _config_public(dossier)
+    if configuration:
+        copie = dossier / configuration["copie"]
+        if not copie.is_file():
+            raise FileNotFoundError(f"Copie du bordereau public introuvable : {copie}. Aucun ancien modèle utilisé.")
+        return copie
+    fichiers = sorted(p for p in dossier.glob("Etat_avancement*.xlsm") if not p.name.startswith("~$"))
+    if not fichiers:
+        raise FileNotFoundError(f"Aucun état d'avancement dans : {dossier}")
+    fiche = dossier.parent / f"{dossier.name}.json"
+    type_etat = lire_json(fiche).get("type_etat") if fiche.exists() else None
+    attendu = {"Public": "Etat_avancement_Public.xlsm", "Privé": "Etat_avancement_Privé.xlsm",
+               "Modèle actuel": "Etat_avancement_02.xlsm"}.get(type_etat)
+    if len(fichiers) == 1:
+        nom = unicodedata.normalize("NFC", fichiers[0].name).casefold()
+        if attendu and nom in {"etat_avancement_public.xlsm", "etat_avancement_privé.xlsm"} and nom != attendu.casefold():
+            raise ValueError(f"L'état présent ne correspond pas au type {type_etat} de la fiche chantier.")
+        return fichiers[0]
+    if attendu:
+        for p in fichiers:
+            if unicodedata.normalize("NFC", p.name).casefold() == attendu.casefold():
+                return p
+    raise ValueError("Plusieurs états d'avancement sont présents sans choix identifiable Public/Privé. "
+                     "Conservez l'état à utiliser ou renseignez le type dans la fiche chantier.")
+
+
+def _signature_excel(chemin, verifier_verrou=True):
+    chemin = Path(chemin)
+    if verifier_verrou and chemin.with_name("~$" + chemin.name).exists():
+        raise ValueError(f"Fermez {chemin.name} dans Excel après l'avoir enregistré, puis réessayez.")
+    stat = chemin.stat()
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
+def _fermer_classeur(wb):
+    wb.close()
+    archive_vba = getattr(wb, "vba_archive", None)
+    if archive_vba is not None:
+        archive_vba.close()
+
+
+def _sauver_excel_atomique(wb, chemin, signature):
+    chemin = Path(chemin)
+    if _signature_excel(chemin) != signature:
+        raise ValueError("Le classeur a été modifié pendant l'opération. Aucun remplacement effectué.")
+    fd, nom = tempfile.mkstemp(prefix=".horizon_", suffix=chemin.suffix, dir=chemin.parent)
+    os.close(fd)
+    temporaire = Path(nom)
+    try:
+        wb.save(temporaire)
+        shutil.copymode(chemin, temporaire)
+        if _signature_excel(chemin) != signature:
+            raise ValueError("Le classeur a été modifié pendant l'opération. Aucun remplacement effectué.")
+        _backup_excel_before_write(chemin)
+        if _signature_excel(chemin) != signature:
+            raise ValueError("Le classeur a été modifié pendant la sauvegarde. Aucun remplacement effectué.")
+        os.replace(temporaire, chemin)
+    finally:
+        temporaire.unlink(missing_ok=True)
+
+
+def _charger_valeurs_excel(chemin, feuille, libelle, max_col=None, lecture_seule=True):
+    """Contrôle les résultats enregistrés, sans recalculer ni écrire le classeur."""
+    formules = load_workbook(chemin, read_only=True, data_only=False)
+    valeurs = None
+    try:
+        valeurs = load_workbook(chemin, read_only=lecture_seule, data_only=True)
+        ws_f = _feuille_etat(formules) if feuille == "Bordereau" else (formules[feuille] if feuille else formules.active)
+        ws_v = valeurs[ws_f.title]
+        manquantes = []
+        for row_f, row_v in zip(ws_f.iter_rows(max_col=max_col), ws_v.iter_rows(max_col=max_col)):
+            for f, v in zip(row_f, row_v):
+                if v.data_type == "e" or (f.data_type == "f" and v.value is None):
+                    manquantes.append(f.coordinate)
+        if manquantes:
+            raise ValueError(f"{libelle} : {len(manquantes)} résultat(s) Excel indisponible(s) ou en erreur "
+                             f"({', '.join(manquantes[:8])}). Recalculez et enregistrez le classeur dans Excel "
+                             "avant de recommencer. Aucun résultat ne peut être validé.")
+        return valeurs
+    except Exception:
+        if valeurs is not None:
+            valeurs.close()
+        raise
+    finally:
+        formules.close()
+
+
+def _charger_pr_controle(chemin):
+    # Lecture seulement : aucune formule, mise en page ou valeur du PR n'est écrite.
+    return _charger_valeurs_excel(chemin, "Chiffrage", "PR")
+
+
+def _verifier_blocs_pr(ws):
+    lignes = list(ws.iter_rows(max_col=16, values_only=True))
+    debuts = [i for i, row in enumerate(lignes, 1) if i >= 3 and _article_pr(row[1])]
+    if not debuts:
+        raise ValueError("Aucun bloc article détecté dans le PR.")
+    erreurs = []
+    def nombre(ligne, colonne):
+        return _nombre_metier(lignes[ligne - 1][colonne - 1], f"ligne {ligne}, colonne {colonne}")
+    for debut in debuts:
+        if debut + 27 > len(lignes):
+            raise ValueError(f"Bloc PR incomplet à la ligne {debut}.")
+        for ligne in range(debut, debut + 10):
+            attendu_k = nombre(ligne, 9) * (1 + nombre(ligne, 10))
+            attendu_l = nombre(ligne, 8) * attendu_k
+            if abs(nombre(ligne, 11) - attendu_k) > 0.01:
+                erreurs.append(f"Ligne {ligne} : PU matière à vérifier")
+            if abs(nombre(ligne, 12) - attendu_l) > 0.01:
+                erreurs.append(f"Ligne {ligne} : total matière à vérifier")
+        for ligne in range(debut + 13, debut + 23):
+            if all(lignes[ligne - 1][col - 1] in (None, "") for col in (8, 9, 10, 11)):
+                continue  # Commentaire sans heures ni coût.
+            attendu_i = nombre(ligne, 3) * nombre(ligne, 8)
+            attendu_k = attendu_i * nombre(ligne, 10)
+            if abs(nombre(ligne, 9) - attendu_i) > 0.01:
+                erreurs.append(f"Ligne {ligne} : heures MO à vérifier")
+            if abs(nombre(ligne, 11) - attendu_k) > 0.01:
+                erreurs.append(f"Ligne {ligne} : coût MO à vérifier")
+    return len(debuts), erreurs
+
+
+def _recalculer_etat(ws, valeurs=None):
+    def normaliser_libelle(valeur):
+        texte = str(valeur or "").strip().lower()
+        texte = texte.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+        texte = texte.replace("à", "a").replace("â", "a").replace("ä", "a")
+        texte = texte.replace("ù", "u").replace("û", "u").replace("ü", "u")
+        texte = texte.replace("î", "i").replace("ï", "i")
+        texte = texte.replace("ô", "o").replace("ö", "o")
+        texte = texte.replace("ç", "c")
+        texte = texte.replace("\n", " ")
+        texte = re.sub(r"\s+", " ", texte)
+        return texte
+
+    def trouver_colonne_bordereau(alias):
+        alias_normalises = {normaliser_libelle(a) for a in alias}
+        max_ligne_entete = min(15, ws.max_row)
+        for ligne in range(1, max_ligne_entete + 1):
+            for col in range(1, ws.max_column + 1):
+                libelle = normaliser_libelle(ws.cell(ligne, col).value)
+                if libelle in alias_normalises or any(a in libelle for a in alias_normalises):
+                    return ws.cell(ligne, col).column_letter
+        return None
+
+    col_quantite = trouver_colonne_bordereau({"quantite", "qte", "qte.", "qte :", "qte/", "qté"})
+    col_prix_unitaire = trouver_colonne_bordereau({"prix unitaire", "pu", "p.u.", "prix unit"})
+
+    if not col_quantite or not col_prix_unitaire:
+        erreurs = []
+        if not col_quantite:
+            erreurs.append("colonne quantité introuvable (attendu : quantité, quantite, qté, qte)")
+        if not col_prix_unitaire:
+            erreurs.append("colonne prix unitaire introuvable (attendu : prix unitaire, pu, p.u., prix unit)")
+        raise ValueError("Impossible de recalculer la feuille Bordereau.\n" + "\n".join(erreurs))
+
+    def nombre_cellule(adresse):
+        cellule = ws[adresse]
+        valeur = cellule.value
+        if cellule.data_type == "f":
+            valeur = valeurs[adresse].value if valeurs is not None else None
+            if valeur is None:
+                raise ValueError(f"Résultat Excel absent en {adresse}. Recalculez et enregistrez l'état dans Excel.")
+        return _nombre_metier(valeur, adresse)
+
+    for ligne in (_postes_publics(ws) if _est_metre_public(ws) else range(24, ws.max_row + 1)):
+        if _ligne_synthese_etat(ws, ligne) or not _article_pr(ws[f"B{ligne}"].value):
+            continue
+        if all(ws[f"{col}{ligne}"].value in (None, "", "-", "—") for col in (col_quantite, col_prix_unitaire)):
+            continue
+        j = nombre_cellule(f"{col_quantite}{ligne}")
+        l = nombre_cellule(f"{col_prix_unitaire}{ligne}")
+        p = nombre_cellule(f"P{ligne}")
+        q = nombre_cellule(f"Q{ligne}")
+
+        r = p + q
+        s = 0 if j == 0 else r / j
+        t = r * l
+        u = q
+        v = l
+        w = u * v
+
+        if j == 0 and l == 0:
+            continue
+
+        ws[f"R{ligne}"] = r
+        ws[f"S{ligne}"] = f'=IF(AND(OR(P{ligne}="",P{ligne}=0),OR(Q{ligne}="",Q{ligne}=0),OR(R{ligne}="",R{ligne}=0)),"",IFERROR(R{ligne}/{col_quantite}{ligne},0))'
+        ws[f"S{ligne}"].number_format = "0.00%"
+        ws[f"T{ligne}"] = t
+        ws[f"U{ligne}"] = u
+        ws[f"V{ligne}"] = v
+        ws[f"W{ligne}"] = w
+
+
+
+
+    # Correction limitée à la formule connue qui ajoutait le mois au cumul une seconde fois.
+    if col_quantite == "E" and col_prix_unitaire == "H":
+        cumul = mois = execute = None
+        for ligne in (_postes_publics(ws) if _est_metre_public(ws) else range(24, ws.max_row + 1)):
+            libelle = _normaliser_libelle_excel(ws[f"S{ligne}"].value)
+            if libelle.startswith("total etat cumule hors tva"):
+                cumul = f"T{ligne}"
+            elif libelle.startswith("total du mois hors tva"):
+                mois = f"T{ligne}"
+            elif libelle.startswith("total execute"):
+                execute = f"T{ligne}"
+        if cumul and mois and execute and ws[execute].value == f"=SUM({cumul}:{mois})":
+            ws[execute] = f"={cumul}"
 
 
 def _normaliser_dossier_data(dossier_chantier: Path) -> Path:
@@ -352,6 +658,38 @@ def _chemin_fichier_chantier(dossier_chantier: Path, nom_fichier: str) -> Path:
         return chemin
 
     return chemin
+
+
+def _montant_a_droite(ws, row, col_depart, nombre, max_ecart=3):
+    if not row or not col_depart:
+        return 0
+
+    for fusion in ws.merged_cells.ranges:
+        if fusion.min_row <= row <= fusion.max_row and fusion.min_col <= col_depart <= fusion.max_col:
+            col_depart = fusion.max_col
+            break
+    col_fin = min(col_depart + max_ecart, ws.max_column)
+
+    for col in range(col_depart + 1, col_fin + 1):
+        val = ws.cell(row=row, column=col).value
+
+        # Ignore les cellules vides ou décoratives
+        if val in (None, "", "-", "—"):
+            continue
+
+        # Si Excel renvoie déjà un nombre, on le prend tel quel
+        if isinstance(val, (int, float)):
+            return float(val)
+
+        # Sinon on passe par le parseur existant
+        num = nombre(val)
+        txt = str(val).strip()
+
+        # Conserve aussi un vrai zéro explicite
+        if num != 0 or txt in {"0", "0,0", "0.0", "0,00", "0.00"}:
+            return num
+
+    return 0
 
 
 def _lire_synthese_avenants_pilotage(ws, convertir_nombre):
@@ -390,7 +728,7 @@ def _protect_formula_cells(wb, source_path: str | Path | None = None) -> None:
 
     for ws in wb.worksheets:
         synthese_debut = None
-        if "etat_avancement" in filename and ws.title == "Bordereau":
+        if ("etat_avancement" in filename and ws.title == "Bordereau") or _est_metre_public(ws):
             synthese_debut = _premiere_ligne_synthese_etat(ws)
 
         for row in ws.iter_rows():
@@ -398,7 +736,8 @@ def _protect_formula_cells(wb, source_path: str | Path | None = None) -> None:
                 if cell.__class__.__name__ == "MergedCell":
                     continue
 
-                in_synthese = synthese_debut is not None and cell.row >= synthese_debut
+                in_synthese = (synthese_debut is not None and cell.row >= synthese_debut
+                               and (not _est_metre_public(ws) or 16 <= cell.column <= 23))
                 has_formula = cell.data_type == "f" or (
                     isinstance(cell.value, str) and cell.value.startswith("=")
                 )
@@ -797,7 +1136,7 @@ def sync_pv_to_copies(chantier_dir: str | Path) -> None:
 # Dossiers (auto Chantier/Chantiers)
 # ---------------------------
 def dossier_base() -> Path:
-    return Path.home() / "Desktop" / "Horizon_Chantier_Data"
+    return _DOSSIER_BASE_MEMOIRE if _DOSSIER_BASE_MEMOIRE is not None else trouver_base()
 
 
 def dossier_chantiers() -> Path:
@@ -812,6 +1151,86 @@ def dossier_chantiers() -> Path:
         return d2
     d2.mkdir(parents=True, exist_ok=True)
     return d2
+def _modeles_creation_chantier(base: Path):
+    def cle(nom):
+        return unicodedata.normalize("NFC", nom).casefold()
+
+    dossiers = {cle(p.name): p for p in base.iterdir() if p.is_dir()}
+    modeles = next((dossiers[cle(n)] for n in ("Modèles", "Modeles", "Modèle", "Modele", "Model")
+                    if cle(n) in dossiers), None)
+    if modeles is None:
+        raise FileNotFoundError(f"Dossier modèles introuvable dans : {base}")
+    fichiers = {cle(p.name): p for p in modeles.iterdir() if p.is_file()}
+    etats = {}
+    for type_etat, nom in (("Privé", "Etat_avancement_Privé.xlsm"),
+                           ("Public", "Etat_avancement_Public.xlsm"),
+                           ("Modèle actuel", "Etat_avancement_02.xlsm")):
+        if cle(nom) in fichiers:
+            etats[type_etat] = fichiers[cle(nom)]
+    return modeles, fichiers, etats
+
+
+def _creer_documents_chantier(base: Path, nom: str, chantier: dict) -> Path:
+    """Prépare tous les documents avant de publier le nouveau chantier."""
+    destination = base / nom
+    json_path = base / f"{nom}.json"
+    if nom in {"", ".", ".."} or Path(nom).name != nom:
+        raise ValueError("Nom de chantier invalide.")
+    if json_path.exists() or (destination.exists() and (
+        not destination.is_dir() or destination.is_symlink() or any(destination.iterdir())
+    )):
+        raise FileExistsError("Ce chantier existe déjà.")
+
+    def cle(nom):
+        return unicodedata.normalize("NFC", nom).casefold()
+
+    modeles, fichiers, etats = _modeles_creation_chantier(base)
+    type_etat = chantier.get("type_etat", "Privé")
+    if type_etat not in {"Public", "Privé", "Modèle actuel"}:
+        raise ValueError("Type d'état d'avancement invalide.")
+    modele_etat = etats.get(type_etat)
+    chantier = dict(chantier)
+    chantier["type_etat"] = type_etat
+    chantier["modeles_etat_manquants"] = [t for t in ("Public", "Privé") if t not in etats]
+    chantier["modele_etat_manquant"] = bool(chantier["modeles_etat_manquants"])
+
+    with tempfile.TemporaryDirectory(prefix=".nouveau_chantier_", dir=base) as temporaire:
+        preparation = Path(temporaire) / "documents"
+
+        def ignorer_etats(src, names):
+            if Path(src) == modeles:
+                return [n for n in names if cle(n).startswith("etat_avancement") and cle(n).endswith(".xlsm")]
+            return []
+
+        shutil.copytree(modeles, preparation, ignore=ignorer_etats)
+        # Chaque chantier reçoit les deux états ; l'utilisateur conserve celui voulu.
+        for type_modele in ("Public", "Privé"):
+            if type_modele in etats:
+                modele = etats[type_modele]
+                shutil.copy2(modele, preparation / modele.name)
+        if type_etat == "Modèle actuel" and modele_etat is not None:
+            shutil.copy2(modele_etat, preparation / modele_etat.name)
+        data = _normaliser_dossier_data(preparation)
+        data.mkdir(exist_ok=True)
+        if not (data / "prix_de_revient.xlsx").exists():
+            pr = fichiers.get(cle("prix_de_revient.xlsx")) or fichiers.get(cle("prix_de_revient model.xlsx"))
+            if pr is None:
+                raise FileNotFoundError(f"Modèle de prix de revient introuvable dans : {modeles}")
+            shutil.copy2(pr, data / "prix_de_revient.xlsx")
+        json_temp = Path(temporaire) / "chantier.json"
+        ecrire_json(json_temp, chantier)
+        # Un dossier strictement vide peut provenir d'une ancienne tentative ratée.
+        if destination.exists():
+            destination.rmdir()
+        preparation.rename(destination)
+        try:
+            json_temp.rename(json_path)
+        except Exception:
+            destination.rename(preparation)
+            raise
+    return json_path
+
+
 def ouvrir_doc(self, nom_fichier):
     sel = self.tree.selection()
     if not sel:
@@ -900,8 +1319,20 @@ def lire_json(path: Path) -> dict:
 
 
 def ecrire_json(path: Path, data: dict) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    path = Path(path)
+    contenu = json.dumps(data, ensure_ascii=False, indent=2)
+    fd, nom = tempfile.mkstemp(prefix=".fiche_", suffix=".json", dir=path.parent)
+    temporaire = Path(nom)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(contenu)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.exists():
+            shutil.copymode(path, temporaire)
+        os.replace(temporaire, path)
+    finally:
+        temporaire.unlink(missing_ok=True)
 
 
 def infos_chantier(chantier: dict) -> dict:
@@ -992,6 +1423,10 @@ class HorizonChantierApp(tk.Tk):
         self._build_ui()
         self.refresh_liste()
 
+    def report_callback_exception(self, exc_type, exc_value, traceback):
+        super().report_callback_exception(exc_type, exc_value, traceback)
+        messagebox.showerror("Opération interrompue", str(exc_value), parent=self)
+
     def _nom_chantier_selectionne(self) -> str | None:
         sel = self.tree.selection()
         if not sel:
@@ -1004,7 +1439,7 @@ class HorizonChantierApp(tk.Tk):
         nom_chantier = self._nom_chantier_selectionne()
         if not nom_chantier:
             return
-        chemin = _chemin_fichier_chantier(dossier_chantiers() / nom_chantier, nom_fichier)
+        chemin = _chemin_fichier_chantier(self._dossier_chantier_selectionne(), nom_fichier)
         if not chemin.exists():
             messagebox.showerror("Introuvable", f"Fichier absent :\n{chemin}")
             return
@@ -1019,9 +1454,11 @@ class HorizonChantierApp(tk.Tk):
         if not nom_chantier:
             return
         try:
-            chemin = next((dossier_chantiers() / nom_chantier).glob(motif))
-        except StopIteration:
-            messagebox.showerror("Introuvable", f"Fichier absent :\n{motif}")
+            chemin = (_selectionner_etat(self._dossier_chantier_selectionne())
+                      if motif == "Etat_avancement*.xlsm"
+                      else next(self._dossier_chantier_selectionne().glob(motif)))
+        except (StopIteration, FileNotFoundError, ValueError) as e:
+            messagebox.showerror("Introuvable", str(e) or f"Fichier absent :\n{motif}")
             return
         if not self._preparer_ouverture_document(chemin):
             return
@@ -1035,7 +1472,9 @@ class HorizonChantierApp(tk.Tk):
             info = infos_chantier(chantier)
             nom = str(info.get("nom") or "").strip()
             if nom:
-                return p.parent / nom
+                dossier = p.parent / nom
+                if dossier.is_dir() and Path(nom).name == nom:
+                    return dossier
         except Exception:
             pass
         return p.parent / p.stem
@@ -1208,7 +1647,7 @@ class HorizonChantierApp(tk.Tk):
             historique.mkdir(exist_ok=True)
 
             nom_source = re.sub(r"\.[^.]+$", "", chemin.name)
-            nom_pdf = f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_{nom_source}.pdf"
+            nom_pdf = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')}_{nom_source}.pdf"
             destination = historique / nom_pdf
 
             _export_excel_to_pdf(chemin, destination)
@@ -1302,7 +1741,12 @@ class HorizonChantierApp(tk.Tk):
         title = ttk.Label(root, text=APP_NAME, font=("Helvetica", 22, "bold"))
         title.pack(anchor="w")
 
-        self.lbl_path = ttk.Label(root, text=f"Emplacement: {dossier_chantiers()}")
+        try:
+            emplacement = str(dossier_chantiers())
+        except (OSError, ValueError) as e:
+            emplacement = str(e)
+        ttk.Button(root, text="Choisir le dossier des chantiers", command=self.choisir_dossier_chantiers).pack(anchor="w")
+        self.lbl_path = ttk.Label(root, text=f"Emplacement: {emplacement}")
         self.lbl_path.pack(fill="x", pady=(4, 8))
 
         cols = ("Chantier", "Client", "État", "Avancement", "Début", "Fin prévue")
@@ -1489,6 +1933,8 @@ class HorizonChantierApp(tk.Tk):
         ).pack(fill="x", pady=3)
 
         ttk.Button(frame_droite, text="📊 Calcul état", command=self.calcul_etat_avancement).pack(fill="x", pady=3)
+        ttk.Button(frame_droite, text="Exporter les prix vers l’original",
+                   command=self.exporter_prix_bordereau_public).pack(fill="x", pady=3)
         btn_cloturer = tk.Label(
             frame_droite,
             text="♻️ Clôturer état",
@@ -2069,175 +2515,64 @@ class HorizonChantierApp(tk.Tk):
         self.ouvrir_aide()
 
     def calcul_etat_avancement(self):
-        nom_chantier = self._nom_chantier_selectionne()
-        if not nom_chantier:
-            return
-        chemin = next(
-            Path(
-                dossier_chantiers() / nom_chantier
-            ).glob("Etat_avancement*.xlsm")
-        ).as_posix()
-
-        feuille = "Bordereau"
-
-        _backup_excel_before_write(chemin)
-        wb = load_workbook(chemin, keep_vba=True)
-        ws = wb[feuille]
-
-        def normaliser_libelle(valeur):
-            texte = str(valeur or "").strip().lower()
-            texte = texte.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
-            texte = texte.replace("à", "a").replace("â", "a").replace("ä", "a")
-            texte = texte.replace("ù", "u").replace("û", "u").replace("ü", "u")
-            texte = texte.replace("î", "i").replace("ï", "i")
-            texte = texte.replace("ô", "o").replace("ö", "o")
-            texte = texte.replace("ç", "c")
-            texte = texte.replace("\n", " ")
-            texte = re.sub(r"\s+", " ", texte)
-            return texte
-
-        def trouver_colonne_bordereau(alias):
-            alias_normalises = {normaliser_libelle(a) for a in alias}
-            max_ligne_entete = min(15, ws.max_row)
-            for ligne in range(1, max_ligne_entete + 1):
-                for col in range(1, ws.max_column + 1):
-                    libelle = normaliser_libelle(ws.cell(ligne, col).value)
-                    if libelle in alias_normalises or any(a in libelle for a in alias_normalises):
-                        return ws.cell(ligne, col).column_letter
-            return None
-
-        col_quantite = trouver_colonne_bordereau({"quantite", "qte", "qte.", "qte :", "qte/", "qté"})
-        col_prix_unitaire = trouver_colonne_bordereau({"prix unitaire", "pu", "p.u.", "prix unit"})
-
-        if not col_quantite or not col_prix_unitaire:
-            erreurs = []
-            if not col_quantite:
-                erreurs.append("colonne quantité introuvable (attendu : quantité, quantite, qté, qte)")
-            if not col_prix_unitaire:
-                erreurs.append("colonne prix unitaire introuvable (attendu : prix unitaire, pu, p.u., prix unit)")
-            wb.close()
-            messagebox.showerror("Calcul état", "Impossible de recalculer la feuille Bordereau.\n" + "\n".join(erreurs))
-            return
-
-        def nombre(valeur):
-            if valeur in (None, "", "-", "—"):
-                return 0
-            try:
-                return float(str(valeur).replace("€", "").replace(" ", "").replace(",", "."))
-            except:
-                return 0
-
-        def ligne_bordereau_valide(ligne):
-            c = ws[f"C{ligne}"].value
-            j = ws[f"{col_quantite}{ligne}"].value
-            l = ws[f"{col_prix_unitaire}{ligne}"].value
-            p = ws[f"P{ligne}"].value
-            q = ws[f"Q{ligne}"].value
-
-            return any(v not in (None, "", "-", "—") for v in [c, j, l, p, q])
-
-        def derniere_ligne_bordereau():
-            derniere = 24
-            lignes_vides = 0
-
-            for ligne in range(24, ws.max_row + 1):
-                if ligne_bordereau_valide(ligne):
-                    derniere = ligne
-                    lignes_vides = 0
-                else:
-                    lignes_vides += 1
-
-                    # dès qu'on a plusieurs lignes vides d'affilée,
-                    # on considère que le bordereau est terminé
-                    if lignes_vides >= 5:
-                        break
-
-            return derniere
-
-        fin = derniere_ligne_bordereau()
-
-        for ligne in range(24, fin + 1):
-            if not ligne_bordereau_valide(ligne):
-                ws[f"S{ligne}"] = None
-                continue
-
-            j = nombre(ws[f"{col_quantite}{ligne}"].value)
-            l = nombre(ws[f"{col_prix_unitaire}{ligne}"].value)
-            p = nombre(ws[f"P{ligne}"].value)
-            q = nombre(ws[f"Q{ligne}"].value)
-
-            r = p + q
-            s = 0 if j == 0 else r / j
-            t = r * l
-            u = q
-            v = l
-            w = u * v
-
-            if j == 0 and l == 0:
-                continue
-
-            ws[f"R{ligne}"] = r
-            ws[f"S{ligne}"] = f'=IF(AND(OR(P{ligne}="",P{ligne}=0),OR(Q{ligne}="",Q{ligne}=0),OR(R{ligne}="",R{ligne}=0)),"",IFERROR(R{ligne}/J{ligne},0))'
-            ws[f"S{ligne}"].number_format = "0.00%"
-            ws[f"T{ligne}"] = t
-            ws[f"U{ligne}"] = u
-            ws[f"V{ligne}"] = v
-            ws[f"W{ligne}"] = w
-
-        
-
-        _protect_formula_cells(wb, chemin)
-        wb.save(chemin)
-        print("Etat recalculé")
-
-
-       
+        if not self._chemin_chantier_selectionne():
+            messagebox.showwarning("Calcul état", "Sélectionne un chantier.")
+            return False
+        wb = valeurs = None
+        try:
+            chemin = _selectionner_etat(self._dossier_chantier_selectionne())
+            signature = _signature_excel(chemin)
+            wb = load_workbook(chemin, keep_vba=Path(chemin).suffix.lower() == ".xlsm")
+            valeurs = load_workbook(chemin, data_only=True)
+            _recalculer_etat(_feuille_etat(wb), _feuille_etat(valeurs))
+            _protect_formula_cells(wb, chemin)
+            _sauver_excel_atomique(wb, chemin, signature)
+            print("Etat recalculé")
+            messagebox.showinfo("Calcul état", "État enregistré. Pour actualiser les formules de synthèse, "
+                                "ouvrez puis enregistrez l'état dans Excel avant le pilotage.")
+            return True
+        except Exception as e:
+            messagebox.showerror("Calcul état", str(e))
+            return False
+        finally:
+            if wb is not None:
+                _fermer_classeur(wb)
+            if valeurs is not None:
+                _fermer_classeur(valeurs)
 
     def mise_a_zero_etat(self):
         if not self._confirmer_cloture_etat():
             return
-
-        p = self._chemin_chantier_selectionne()
-        if not p:
+        if not self._chemin_chantier_selectionne():
             messagebox.showwarning("Clôturer état", "Sélectionne un chantier dans la liste.")
             return
-        dossier = self._dossier_depuis_json(p)
+        wb = valeurs = None
         try:
-            chemin = next(dossier.glob("Etat_avancement*.xlsm"))
-        except StopIteration:
-            messagebox.showerror(
-                "Clôturer état",
-                "Aucun fichier Etat_avancement*.xlsm dans le dossier du chantier.",
-            )
-            return
-
-        dossier_sauvegarde = chemin.parent / "Sauvegarde"
-        horodatage = time.strftime("%Y-%m-%d_%H-%M-%S")
-        copie_datee = dossier_sauvegarde / f"{chemin.stem}_{horodatage}{chemin.suffix}"
-        try:
-            dossier_sauvegarde.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(chemin, copie_datee)
+            chemin = _selectionner_etat(self._dossier_chantier_selectionne())
+            signature = _signature_excel(chemin)
+            wb = load_workbook(chemin, keep_vba=Path(chemin).suffix.lower() == ".xlsm")
+            valeurs = load_workbook(chemin, data_only=True)
+            ws = _feuille_etat(wb)
+            # Valider et recalculer avant le report, puis publier en une seule écriture.
+            _recalculer_etat(ws, _feuille_etat(valeurs))
+            _reporter_quantites_cloture(ws)
+            _recalculer_etat(ws, _feuille_etat(valeurs))
+            _protect_formula_cells(wb, chemin)
+            sauvegarde = chemin.parent / "Sauvegarde"
+            sauvegarde.mkdir(parents=True, exist_ok=True)
+            copie = sauvegarde / f"{chemin.stem}_{datetime.now():%Y-%m-%d_%H-%M-%S_%f}{chemin.suffix}"
+            shutil.copy2(chemin, copie)
+            _sauver_excel_atomique(wb, chemin, signature)
+            print("Clôture état effectuée")
+            messagebox.showinfo("Clôturer état", "Clôture enregistrée et sauvegarde conservée. "
+                                "Ouvrez puis enregistrez l'état dans Excel pour actualiser les synthèses avant le pilotage.")
         except Exception as e:
-            messagebox.showerror(
-                "Clôturer état",
-                f"La sauvegarde avant clôture a échoué.\nLa clôture est annulée.\n{e}",
-            )
-            return
-
-        try:
-            wb = load_workbook(chemin, keep_vba=True)
-            ws = wb["Bordereau"]
-            for ligne in range(24, ws.max_row + 1):
-                ws[f"P{ligne}"] = ws[f"R{ligne}"].value
-                ws[f"Q{ligne}"] = 0
-            wb.save(chemin)
-            wb.close()
-        except Exception as e:
-            messagebox.showerror("Clôturer état", f"La clôture a échoué.\n{e}")
-            return
-
-        self.calcul_etat_avancement()
-        print("Clôture état effectuée")
+            messagebox.showerror("Clôturer état", f"La clôture n'a pas été enregistrée.\n{e}")
+        finally:
+            if wb is not None:
+                _fermer_classeur(wb)
+            if valeurs is not None:
+                _fermer_classeur(valeurs)
 
     def verifier_pr(self):
         p = self._chemin_chantier_selectionne()
@@ -2265,68 +2600,27 @@ class HorizonChantierApp(tk.Tk):
             "Date du PR",
             f"Dernier enregistrement du PR :\n{date_modif}\n\n"
             "⚠️ Si tu viens de modifier le PR :\n"
-            "➡️ fais CMD + S dans Excel\n"
+            "➡️ enregistre dans Excel (Ctrl+S sur Windows, Cmd+S sur Mac)\n"
             "➡️ puis clique sur Vérifier PR"
         )
         
-        wb = load_workbook(chemin, data_only=True)
-        ws = wb["Chiffrage"]
+        wb = None
+        try:
+            wb = _charger_pr_controle(chemin)
+            nb_blocs, erreurs = _verifier_blocs_pr(wb["Chiffrage"])
+            if erreurs:
+                messagebox.showwarning("PR", f"{len(erreurs)} écart(s) aux contrôles matière/MO sur {nb_blocs} bloc(s).\n"
+                                       "Les règles particulières des postes restent à vérifier ; aucune formule n'est modifiée.\n\n"
+                                       + "\n".join(erreurs[:40])
+                                       + ("\n… Autres écarts non affichés." if len(erreurs) > 40 else ""))
+            else:
+                messagebox.showinfo("PR", f"Contrôles matière et main-d'œuvre cohérents sur {nb_blocs} bloc(s).")
+        except Exception as e:
+            messagebox.showerror("Vérifier PR", str(e))
+        finally:
+            if wb is not None:
+                wb.close()
 
-        def nombre(v):
-            if v in (None, "", "-", "—"):
-                return 0
-            try:
-                return float(str(v).replace("€", "").replace(" ", "").replace(",", "."))
-            except:
-                return 0
-
-        erreurs = []
-
-        # MATIÈRE
-        for ligne in range(3, 13):
-            i = nombre(ws[f"I{ligne}"].value)
-            j = nombre(ws[f"J{ligne}"].value)
-            h = nombre(ws[f"H{ligne}"].value)
-
-            attendu_k = i * (1 + j)
-            attendu_l = h * attendu_k
-
-            k = nombre(ws[f"K{ligne}"].value)
-            l = nombre(ws[f"L{ligne}"].value)
-
-            if abs(k - attendu_k) > 0.01:
-                erreurs.append(f"Ligne {ligne} PU corrigé faux")
-
-            if abs(l - attendu_l) > 0.01:
-                erreurs.append(f"Ligne {ligne} Total matière faux")
-
-        # MAIN-D’ŒUVRE
-        for ligne in range(16, 26):
-            c = nombre(ws[f"C{ligne}"].value)
-            h = nombre(ws[f"H{ligne}"].value)
-            j = nombre(ws[f"J{ligne}"].value)
-
-            attendu_i = c * h
-            attendu_k = attendu_i * j
-
-            i = nombre(ws[f"I{ligne}"].value)
-            k = nombre(ws[f"K{ligne}"].value)
-
-            if abs(i - attendu_i) > 0.01:
-                erreurs.append(f"Ligne {ligne} Heures fausses")
-
-            if abs(k - attendu_k) > 0.01:
-                erreurs.append(f"Ligne {ligne} Coût MO faux")
-
-        if erreurs:
-            messagebox.showwarning("PR", "\n".join(erreurs))
-        else:
-            messagebox.showinfo("PR", "✔ Tous les calculs sont corrects")
-
-        wb.close()
-
-
-            
     def pilotage_chantier(self):
         import os
         import subprocess
@@ -2344,14 +2638,18 @@ class HorizonChantierApp(tk.Tk):
         if not nom_chantier:
             return
 
-        chemin = next(
-            Path(
-                dossier_chantiers() / nom_chantier
-            ).glob("Etat_avancement*.xlsm")
-        ).as_posix()
+        try:
+            chemin = _selectionner_etat(self._dossier_chantier_selectionne()).as_posix()
+        except (FileNotFoundError, ValueError) as e:
+            messagebox.showerror("Pilotage", str(e))
+            return
 
-        wb = load_workbook(chemin, data_only=True)
-        ws = wb["Bordereau"]
+        try:
+            wb = _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement", max_col=23, lecture_seule=False)
+        except Exception as e:
+            messagebox.showerror("Pilotage", str(e))
+            return
+        ws = _feuille_etat(wb)
         
 
         def nombre(val):
@@ -2383,31 +2681,7 @@ class HorizonChantierApp(tk.Tk):
             return None, None
 
         def premiere_valeur_a_droite(row, col_depart, max_ecart=3):
-            if not row or not col_depart:
-                return 0
-
-            col_fin = min(col_depart + max_ecart, ws.max_column)
-
-            for col in range(col_depart + 1, col_fin + 1):
-                val = ws.cell(row=row, column=col).value
-
-                # Ignore les cellules vides ou décoratives
-                if val in (None, "", "-", "—"):
-                    continue
-
-                # Si Excel renvoie déjà un nombre, on le prend tel quel
-                if isinstance(val, (int, float)):
-                    return float(val)
-
-                # Sinon on passe par le parseur existant
-                num = nombre(val)
-                txt = str(val).strip()
-
-                # Conserve aussi un vrai zéro explicite
-                if num != 0 or txt in {"0", "0,0", "0.0", "0,00", "0.00"}:
-                    return num
-
-            return 0
+            return _montant_a_droite(ws, row, col_depart, nombre, max_ecart)
 
         def valeur_soumission_publique(libelles):
             for libelle in libelles:
@@ -2419,6 +2693,14 @@ class HorizonChantierApp(tk.Tk):
         montant_soumission, ligne_soumission, col_soumission = valeur_soumission_publique(
             ["total soumission hors tva"]
         )
+        if ligne_soumission is None:
+            montant_sauvegarde = _soumission_avant_cloture(chemin, nombre)
+            if montant_sauvegarde is not None:
+                montant_soumission = montant_sauvegarde
+            else:
+                wb.close()
+                messagebox.showerror("Pilotage", "Montant de soumission introuvable dans l'état et ses sauvegardes.")
+                return
         _total_etat_cumule, _ligne_etat_cumule, _col_etat_cumule = valeur_soumission_publique(
             ["total état cumulé hors tva", "total etat cumulé hors tva"]
         )
@@ -2431,6 +2713,8 @@ class HorizonChantierApp(tk.Tk):
         total_realise, ligne_execute, col_execute = valeur_soumission_publique(
             ["total exécuté", "total execute"]
         )
+        if _ligne_etat_cumule is not None:
+            total_realise = _total_etat_cumule
         revision, _ligne_revision, _col_revision = valeur_soumission_publique(
             ["montant de la révision", "montant de la revision"]
         )
@@ -2439,7 +2723,12 @@ class HorizonChantierApp(tk.Tk):
             ["montant global à facturer", "montant global a facturer"]
         )
 
-        if "Avenants" in wb.sheetnames:
+        if _est_metre_public(ws) and ws["P9"].value == "Numéro de l’état":
+            avenants_plus, _, _ = valeur_soumission_publique(["avenants cumulés en plus"])
+            avenants_moins, _, _ = valeur_soumission_publique(["avenants cumulés en moins"])
+            avenants_moins = abs(avenants_moins)
+            revision_globale, _, _ = valeur_soumission_publique(["total des révision cumulé"])
+        elif "Avenants" in wb.sheetnames:
             ws_avenants = wb["Avenants"]
             avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
                 ws_avenants,
@@ -2449,7 +2738,7 @@ class HorizonChantierApp(tk.Tk):
             avenants_moins = 0
             chemin_avenants = Path(chemin).with_name("Avenants.xlsx")
             if chemin_avenants.exists():
-                wb_avenants = load_workbook(chemin_avenants, data_only=True)
+                wb_avenants = _charger_valeurs_excel(chemin_avenants, None, "Avenants", max_col=7, lecture_seule=False)
                 ws_avenants = wb_avenants["Avenants"] if "Avenants" in wb_avenants.sheetnames else wb_avenants.active
                 avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
                     ws_avenants,
@@ -2459,8 +2748,8 @@ class HorizonChantierApp(tk.Tk):
         total_marche = montant_soumission + avenants_plus - avenants_moins
 
         chemin_revision_globale = Path(chemin).with_name("Revision_global.xlsx")
-        if chemin_revision_globale.exists():
-            wb_revision_globale = load_workbook(chemin_revision_globale, data_only=True)
+        if chemin_revision_globale.exists() and not (_est_metre_public(ws) and ws["P9"].value == "Numéro de l’état"):
+            wb_revision_globale = _charger_valeurs_excel(chemin_revision_globale, None, "Révision globale", max_col=5, lecture_seule=False)
             ws_revision_globale = wb_revision_globale.active
             revision_globale = _lire_revision_globale_pilotage(ws_revision_globale, nombre)
             wb_revision_globale.close()
@@ -2969,14 +3258,14 @@ class HorizonChantierApp(tk.Tk):
             if not nom_chantier:
                 return
 
-            dossier_chantier = dossier_chantiers() / nom_chantier
+            dossier_chantier = self._dossier_chantier_selectionne()
             fichier_delai = os.path.join(dossier_chantier, "Delai.xlsx")
 
             if not os.path.exists(fichier_delai):
                 messagebox.showerror("Erreur", f"Fichier introuvable :\n{fichier_delai}")
                 return
 
-            wb = load_workbook(fichier_delai, data_only=True)
+            wb = _charger_valeurs_excel(fichier_delai, None, Path(fichier_delai).stem, max_col=15, lecture_seule=False)
             ws = wb.active
 
             def lire_valeur_delai(libelles):
@@ -3508,14 +3797,14 @@ class HorizonChantierApp(tk.Tk):
             if not nom_chantier:
                 return
 
-            dossier_chantier = dossier_chantiers() / nom_chantier
+            dossier_chantier = self._dossier_chantier_selectionne()
             fichier_delai = os.path.join(dossier_chantier, "Rendement.xlsx")
 
             if not os.path.exists(fichier_delai):
                 messagebox.showerror("Erreur", f"Fichier introuvable :\n{fichier_delai}")
                 return
 
-            wb = load_workbook(fichier_delai, data_only=True)
+            wb = _charger_valeurs_excel(fichier_delai, None, Path(fichier_delai).stem, max_col=15, lecture_seule=False)
             ws = wb.active
 
             heures_soumission = nombre(ws["O65"].value)
@@ -4010,12 +4299,32 @@ class HorizonChantierApp(tk.Tk):
             return None
         return Path(sel[0])
 
+    def choisir_dossier_chantiers(self):
+        global _DOSSIER_BASE_MEMOIRE
+        choix = filedialog.askdirectory(title="Choisir Horizon_Chantier_Data ou le dossier Chantiers")
+        if not choix:
+            return
+        try:
+            memoriser_base(choix)
+            _DOSSIER_BASE_MEMOIRE = Path(choix)
+            self.refresh_liste()
+        except OSError as e:
+            messagebox.showerror("Emplacement des chantiers", str(e))
+
     def refresh_liste(self) -> None:
-        self.lbl_path.config(text=f"Emplacement: {dossier_chantiers()}")
+        try:
+            emplacement = dossier_chantiers()
+        except (OSError, ValueError) as e:
+            self.lbl_path.config(text=str(e))
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            messagebox.showerror("Emplacement des chantiers", str(e))
+            return
+        self.lbl_path.config(text=f"Emplacement: {emplacement}")
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        d = dossier_chantiers()
+        d = emplacement
         fichiers = sorted(d.glob("*.json"))
         fichiers_illisibles = []
 
@@ -4283,134 +4592,147 @@ class HorizonChantierApp(tk.Tk):
             "Date du PR",
             f"Dernier enregistrement du PR :\n{date_modif}\n\n"
             "⚠️ Si tu viens de modifier le PR :\n"
-            "➡️ fais CMD + S dans Excel\n"
+            "➡️ enregistre dans Excel (Ctrl+S sur Windows, Cmd+S sur Mac)\n"
             "➡️ puis clique sur Calcul / Reca"
         )
 
         try:
-            self.importer_pr_dans_etat()
-            messagebox.showinfo(
-                "Calcul / Reca",
-                "Prix de revient importé dans l'état d'avancement."
-            )
+            nb_importes = self.importer_pr_dans_etat()
+            if nb_importes:
+                doublons = getattr(self, "_dernier_import_pr_doublons", [])
+                precision = ("\n\nCodes répétés avec des prix différents : " + ", ".join(doublons)
+                             + ".\nComme auparavant, le dernier prix du PR est utilisé pour chaque code." if doublons else "")
+                messagebox.showinfo("Calcul / Reca", f"{nb_importes} article(s) importé(s) dans l'état d'avancement.\n"
+                                    "Ouvrez puis enregistrez l'état dans Excel pour actualiser ses formules avant la suite des calculs."
+                                    + precision)
+            else:
+                messagebox.showwarning("Calcul / Reca", "Aucun article correspondant : aucun prix importé.")
         except Exception as e:
             messagebox.showerror("Erreur", str(e))
 
     def _dossier_chantier_selectionne(self) -> Path:
-        sel = self.tree.selection()
-        if not sel:
+        p = self._chemin_chantier_selectionne()
+        if not p:
             raise ValueError("Sélectionne un chantier dans la liste.")
-
-        item = self.tree.item(sel[0])
-        vals = item.get("values", [])
-        chantier_sel = str(vals[0]).strip() if vals else ""
-
-        base = dossier_chantiers()
-        return base / chantier_sel
+        return self._dossier_depuis_json(p)
 
     def importer_pr_dans_etat(self):
+        self._dernier_import_pr_doublons = []
         dossier = self._dossier_chantier_selectionne()
-        chemin_pr = _normaliser_dossier_data(dossier) / "prix_de_revient.xlsx"
-
+        chemin_pr = dossier / "data" / "prix_de_revient.xlsx"
+        chemin_etat = _selectionner_etat(dossier)
+        if not chemin_pr.is_file():
+            raise FileNotFoundError(f"PR introuvable : {chemin_pr}")
+        signature = _signature_excel(chemin_etat)
+        signature_pr = _signature_excel(chemin_pr, verifier_verrou=False)
+        wb_pr = wb_etat = None
         try:
-            chemin_etat = next(dossier.glob("Etat_avancement*.xlsm"))
-        except StopIteration:
-           return
-
-        if not chemin_pr.exists():
-            return
-
-        wb_pr = load_workbook(chemin_pr, data_only=True)
-        ws_pr = wb_pr["Chiffrage"]
-
-        _backup_excel_before_write(chemin_etat)
-        wb_etat = load_workbook(chemin_etat, keep_vba=True)
-        ws_etat = wb_etat["Bordereau"]
-        nb_importes = 0
-
-        def clean_article(val):
-            if val is None:
-                return ""
-
-            txt = str(val).strip().replace("\xa0", " ").replace(",", ".").lower()
-            txt = re.sub(r"\s+", "", txt)
-            if not txt:
-                return ""
-
-            parts = []
-            for part in txt.split("."):
-                if not part:
+            wb_pr = _charger_pr_controle(chemin_pr)
+            ws_pr = wb_pr["Chiffrage"]
+            # Même règle métier qu'avant : prix HT en F, 27 lignes après l'article.
+            lignes_pr = list(ws_pr.iter_rows(max_col=6, values_only=True))
+            pr_map = {}
+            doublons = set()
+            for row, valeurs in enumerate(lignes_pr, 1):
+                article = _article_pr(valeurs[1]) if row >= 3 else ""
+                if not article:
                     continue
+                valeur = lignes_pr[row + 26][5] if row + 26 < len(lignes_pr) else None
+                if not isinstance(valeur, (int, float)) or isinstance(valeur, bool) or not math.isfinite(valeur):
+                    raise ValueError(f"Prix HT indisponible pour l'article {article} (F{row + 27}). "
+                                     "Vérifiez et enregistrez le PR dans Excel. Aucun import effectué.")
+                prix = float(valeur)
+                if article in pr_map and pr_map[article] != prix:
+                    doublons.add(article)
+                # Préserver la priorité historique : dernière occurrence du code dans le PR.
+                pr_map[article] = prix
+            if not pr_map:
+                raise ValueError("Aucun article avec prix HT trouvé dans le PR.")
+            wb_etat = load_workbook(chemin_etat, keep_vba=Path(chemin_etat).suffix.lower() == ".xlsm")
+            ws_etat = _feuille_etat(wb_etat)
+            def normaliser_libelle(val):
+                txt = str(val or "").strip().lower()
+                txt = txt.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+                txt = txt.replace("à", "a").replace("â", "a").replace("ä", "a")
+                txt = txt.replace("ù", "u").replace("û", "u").replace("ü", "u")
+                txt = txt.replace("î", "i").replace("ï", "i")
+                txt = txt.replace("ô", "o").replace("ö", "o")
+                txt = txt.replace("ç", "c")
+                txt = re.sub(r"\s+", " ", txt)
+                return txt
 
-                match = re.fullmatch(r"(\d+)([a-z]+)?", part)
-                if match:
-                    numero = str(int(match.group(1)))
-                    suffixe = match.group(2) or ""
-                    parts.append(numero + suffixe)
-                    continue
+            def est_modele_marche_public():
+                for ligne in range(1, min(ws_etat.max_row, 25) + 1):
+                    h = normaliser_libelle(ws_etat[f"H{ligne}"].value)
+                    i = normaliser_libelle(ws_etat[f"I{ligne}"].value)
+                    j = normaliser_libelle(ws_etat[f"J{ligne}"].value)
+                    if "en chiffres" in h and "en lettres" in i and "somme" in j:
+                        return True
+                return False
 
-                cleaned = re.sub(r"[^0-9a-z]+", "", part)
-                if cleaned:
-                    parts.append(cleaned)
+            if _est_metre_public(ws_etat) and doublons:
+                raise ValueError("Prix PR contradictoires pour : " + ", ".join(sorted(doublons)))
+            marche_public = est_modele_marche_public()
+            colonne = "H" if marche_public else "L"
+            correspondances = []
+            for row in (_postes_publics(ws_etat) if _est_metre_public(ws_etat) else range(24, ws_etat.max_row + 1)):
+                article = _article_pr(ws_etat[f"B{row}"].value)
+                if article in pr_map:
+                    cellule = ws_etat[f"{colonne}{row}"]
+                    if cellule.data_type == "f":
+                        raise ValueError(f"Le prix {cellule.coordinate} contient une formule. "
+                                         "Import annulé pour la préserver.")
+                    correspondances.append((cellule, pr_map[article]))
+            if not correspondances:
+                return 0
+            if _signature_excel(chemin_pr, verifier_verrou=False) != signature_pr:
+                raise ValueError("Le PR a changé pendant la lecture. Relancez l'import.")
+            for cellule, prix in correspondances:
+                cellule.value = prix
+            _protect_formula_cells(wb_etat, chemin_etat)
+            _sauver_excel_atomique(wb_etat, chemin_etat, signature)
+            self._dernier_import_pr_doublons = sorted(doublons)
+            return len(correspondances)
+        finally:
+            if wb_pr is not None:
+                _fermer_classeur(wb_pr)
+            if wb_etat is not None:
+                _fermer_classeur(wb_etat)
 
-            article = ".".join(parts)
-            return article if any(c.isdigit() for c in article) else ""
+    def exporter_prix_bordereau_public(self):
+        temporaire = None
+        try:
+            dossier = self._dossier_chantier_selectionne()
+            config = _config_public(dossier)
+            if not config:
+                raise ValueError("Aucune copie de bordereau public configurée pour ce chantier.")
+            original, copie = dossier / config["original"], dossier / config["copie"]
+            signature = _signature_excel(original)
+            signature_copie = _signature_excel(copie)
+            fd, nom = tempfile.mkstemp(suffix=".xlsx", dir=dossier)
+            os.close(fd)
+            temporaire = Path(nom)
+            nombre = _exporter_prix_public(original, copie, temporaire, config["sha256_original"])
+            if not messagebox.askyesno("Transfert final des prix",
+                    f"Transférer les {nombre} prix unitaires de {copie.name} vers {original.name} ?\n"
+                    "Seules les cellules de prix seront modifiées. Une sauvegarde sera conservée."):
+                return
+            if _signature_excel(original) != signature or _signature_excel(copie) != signature_copie:
+                raise ValueError("Un fichier a changé pendant la préparation. Relancez le transfert.")
+            _backup_excel_before_write(original)
+            if _signature_excel(original) != signature:
+                raise ValueError("L'original a changé pendant la sauvegarde.")
+            os.replace(temporaire, original)
+            import hashlib
+            config["sha256_original"] = hashlib.sha256(original.read_bytes()).hexdigest()
+            ecrire_json(dossier / "bordereau_public.json", config)
+            messagebox.showinfo("Prix transférés", f"{nombre} prix transférés. Ouvrez l’original dans Excel pour actualiser ses totaux.")
+        except Exception as e:
+            messagebox.showerror("Transfert des prix", str(e))
+        finally:
+            if temporaire is not None:
+                temporaire.unlink(missing_ok=True)
 
-        def normaliser_libelle(val):
-            txt = str(val or "").strip().lower()
-            txt = txt.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
-            txt = txt.replace("à", "a").replace("â", "a").replace("ä", "a")
-            txt = txt.replace("ù", "u").replace("û", "u").replace("ü", "u")
-            txt = txt.replace("î", "i").replace("ï", "i")
-            txt = txt.replace("ô", "o").replace("ö", "o")
-            txt = txt.replace("ç", "c")
-            txt = re.sub(r"\s+", " ", txt)
-            return txt
-
-        def est_modele_marche_public():
-            for ligne in range(1, min(ws_etat.max_row, 25) + 1):
-                h = normaliser_libelle(ws_etat[f"H{ligne}"].value)
-                i = normaliser_libelle(ws_etat[f"I{ligne}"].value)
-                j = normaliser_libelle(ws_etat[f"J{ligne}"].value)
-                if "en chiffres" in h and "en lettres" in i and "somme" in j:
-                    return True
-            return False
-
-        marche_public = est_modele_marche_public()
-
-        pr_map = {}
-        for row in range(3, ws_pr.max_row + 1):
-            article = clean_article(ws_pr[f"B{row}"].value)
-            if not article:
-                continue
-
-            ligne_valeur = row + 27
-            valeur = ws_pr[f"F{ligne_valeur}"].value
-
-            if isinstance(valeur, (int, float)):
-                pr_map[article] = float(valeur)
-
-        for row in range(24, ws_etat.max_row + 1):
-            article = clean_article(ws_etat[f"B{row}"].value)
-            if not article:
-                continue
-
-            if article in pr_map:
-                prix = pr_map[article]
-                if marche_public:
-                    ws_etat[f"H{row}"] = prix
-                else:
-                    ws_etat[f"L{row}"] = prix
-                nb_importes += 1
-
-        _protect_formula_cells(wb_etat, chemin_etat)
-        wb_etat.save(chemin_etat)
-        wb_pr.close()
-        wb_etat.close()
-
-        from tkinter import messagebox
-        messagebox.showinfo("Import PR", f"{nb_importes} article(s) importé(s).")
-  
     def ouvrir_chantier(self) -> None:
         p = self._chemin_chantier_selectionne()
         if not p:
@@ -4458,10 +4780,31 @@ class HorizonChantierApp(tk.Tk):
         if self._doit_rappeler_pdf_historique(dossier):
             self._planifier_rappel_pdf_historique_ouverture()
 
+    def ouvrir_dossier_sauvegarde(self) -> None:
+        p = self._chemin_chantier_selectionne()
+        if not p:
+            messagebox.showwarning("Sauvegarde", "Sélectionne un chantier dans la liste.")
+            return
+
+        dossier_sauvegarde = self._dossier_depuis_json(p) / "Sauvegarde"
+        if not dossier_sauvegarde.exists():
+            messagebox.showwarning(
+                "Sauvegarde",
+                f"Aucun dossier de sauvegarde pour ce chantier :\n{dossier_sauvegarde}",
+            )
+            return
+
+        ouvrir_dossier(dossier_sauvegarde)
+
     def nouveau_chantier(self) -> None:
+        try:
+            _, _, etats_disponibles = _modeles_creation_chantier(dossier_chantiers())
+        except Exception as e:
+            messagebox.showerror("Nouveau chantier", str(e))
+            return
         win = tk.Toplevel(self)
         win.title("Nouveau chantier")
-        win.geometry("820x320")
+        win.geometry("820x570")
         win.resizable(False, False)
 
         client_var = tk.StringVar(value="")
@@ -4486,11 +4829,29 @@ class HorizonChantierApp(tk.Tk):
         e_adresse = ttk.Entry(frame, textvariable=adresse_var, width=90)
         e_adresse.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 12))
 
-        ttk.Label(frame, text="Type d'état d'avancement").grid(row=6, column=0, sticky="w")
+        entrees_contact = {}
+        for ligne, (cle, libelle) in enumerate((
+            ("personne_contact", "Personne de contact"),
+            ("telephone", "Téléphone"),
+            ("email", "E-mail"),
+        )):
+            ttk.Label(frame, text=libelle).grid(row=6 + ligne * 2, column=0, sticky="w")
+            entree = ttk.Entry(frame, width=90)
+            entree.grid(row=7 + ligne * 2, column=0, columnspan=2, sticky="ew", pady=(2, 8))
+            entrees_contact[cle] = entree
+
+        ttk.Label(frame, text="Type d'état d'avancement").grid(row=12, column=0, sticky="w")
         choix_etat = ttk.Frame(frame)
-        choix_etat.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 12))
-        ttk.Radiobutton(choix_etat, text="Privé", variable=type_etat_var, value="Privé").pack(side="left", padx=(0, 18))
-        ttk.Radiobutton(choix_etat, text="Public", variable=type_etat_var, value="Public").pack(side="left")
+        choix_etat.grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 12))
+        for type_etat in ("Privé", "Public"):
+            ttk.Radiobutton(choix_etat, text=type_etat, variable=type_etat_var,
+                            value=type_etat).pack(side="left", padx=(0, 18))
+
+        if any(t not in etats_disponibles for t in ("Privé", "Public")):
+            ttk.Label(frame, text=(
+                "Les modèles d’état Public/Privé sont incomplets. Le chantier et le prix de revient\n"
+                "peuvent être créés ; les états manquants devront être ajoutés."
+            ), wraplength=760).grid(row=14, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         def valider():
             nom_client = e_client.get().strip()
@@ -4510,14 +4871,17 @@ class HorizonChantierApp(tk.Tk):
             json_path = base / f"{nom_fichier}.json"
             dossier_path = base / nom_fichier
 
-            if json_path.exists() or dossier_path.exists():
+            if json_path.exists() or (dossier_path.exists() and (
+                not dossier_path.is_dir() or dossier_path.is_symlink() or any(dossier_path.iterdir())
+            )):
                 messagebox.showwarning("Nouveau chantier", "Ce chantier existe déjà.")
                 return
 
             chantier = {
-                "chantier": nom_chantier,
+                "chantier": nom_fichier,
                 "client": nom_client,
                 "adresse": adresse_chantier,
+                **{cle: entree.get().strip() for cle, entree in entrees_contact.items()},
                 "type_etat": type_etat_var.get(),
                 "etat": "Devis",
                 "avancement": 0,
@@ -4525,38 +4889,18 @@ class HorizonChantierApp(tk.Tk):
             }
 
             try:
-                dossier_path.mkdir(parents=True, exist_ok=False)
-                modeles_path = base / "Modèles"
-                if not modeles_path.exists():
-                    raise FileNotFoundError(f"Dossier modèles introuvable : {modeles_path}")
-                nom_modele_etat = (
-                    "Etat_avancement_Public.xlsm"
-                    if type_etat_var.get() == "Public"
-                    else "Etat_avancement_Privé.xlsm"
-                )
-                modele_etat = modeles_path / nom_modele_etat
-                if not modele_etat.exists():
-                    raise FileNotFoundError(f"Modèle état d'avancement introuvable : {modele_etat}")
-
-                def ignorer_etats_avancement(src, names):
-                    if Path(src) == modeles_path:
-                        return [name for name in names if name.startswith("Etat_avancement") and name.endswith(".xlsm")]
-                    return []
-
-                shutil.copytree(modeles_path, dossier_path, dirs_exist_ok=True, ignore=ignorer_etats_avancement)
-                shutil.copy2(modele_etat, dossier_path / nom_modele_etat)
-                data_path = _normaliser_dossier_data(dossier_path)
-                data_path.mkdir(exist_ok=True)
-                pr_modele = modeles_path / "prix_de_revient.xlsx"
-                pr_data = data_path / "prix_de_revient.xlsx"
-                if pr_modele.exists() and not pr_data.exists():
-                    shutil.copy2(pr_modele, pr_data)
-                ecrire_json(json_path, chantier)
+                _creer_documents_chantier(base, nom_fichier, chantier)
                 self.refresh_liste()
                 if self.tree.exists(str(json_path)):
                     self.tree.selection_set(str(json_path))
                     self.tree.focus(str(json_path))
                 win.destroy()
+                if lire_json(json_path).get("modele_etat_manquant"):
+                    messagebox.showinfo("Chantier créé", (
+                        "Le chantier est créé et son prix de revient est disponible.\n\n"
+                        "Modèles d’état absents : " + ", ".join(lire_json(json_path).get("modeles_etat_manquants", [])) + ".\n"
+                        "Aucun état d’un autre chantier ou logiciel n’a été utilisé."
+                    ))
                 return
             except Exception as e:
                 messagebox.showerror("Nouveau chantier", f"Impossible de créer le chantier.\n{e}")
@@ -4565,7 +4909,7 @@ class HorizonChantierApp(tk.Tk):
             win.destroy()
 
         btns = ttk.Frame(frame)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e")
+        btns.grid(row=15, column=0, columnspan=2, sticky="e")
         ttk.Button(btns, text="Annuler", command=win.destroy).pack(side="right")
         ttk.Button(btns, text="Valider", command=valider).pack(side="right", padx=(0, 8))
 
@@ -4646,9 +4990,9 @@ class HorizonChantierApp(tk.Tk):
 
             donnees_modifiees = dict(chantier)
             if "nom" in donnees_modifiees:
-                donnees_modifiees["nom"] = nom_chantier
+                donnees_modifiees["nom"] = nouveau_nom_fichier
             if "chantier" in donnees_modifiees or "nom" not in donnees_modifiees:
-                donnees_modifiees["chantier"] = nom_chantier
+                donnees_modifiees["chantier"] = nouveau_nom_fichier
             donnees_modifiees.update({
                 "client": nom_client,
                 "adresse": adresse,
