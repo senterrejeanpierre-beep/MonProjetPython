@@ -368,6 +368,23 @@ class FichiersMetier(unittest.TestCase):
         _, erreurs = _verifier_blocs_pr(valeurs, formules)
         self.assertIn("Ligne 3 : PU matière à vérifier", erreurs)
 
+    def test_pr_formules_particulieres_controle_leurs_operandes(self):
+        valeurs = Workbook().active
+        formules = Workbook().active
+        for ws in (valeurs, formules):
+            ws["B3"], ws["B30"] = "01.02", "RÉCAPITULATIF POSTE"
+            ws["G3"], ws["H3"], ws["K3"] = 2, 5, 10
+            ws["J16"] = 55
+        valeurs["L3"], valeurs["H16"], valeurs["I16"], valeurs["K16"] = 20, 1.6, 3.2, 176
+        formules["L3"] = "=SUM(K3*G3)"
+        formules["I16"] = "=SUM(H16*C15)"
+        formules["K16"] = "=SUM(J16*I16)"
+        _, erreurs = _verifier_blocs_pr(valeurs, formules)
+        self.assertEqual(erreurs, [])
+        valeurs["K16"] = 175
+        _, erreurs = _verifier_blocs_pr(valeurs, formules)
+        self.assertEqual(erreurs, ["Ligne 16 : coût MO à vérifier"])
+
     def test_echec_fiche_json_preserve_original(self):
         p = self.base / "fiche.json"
         ecrire_json(p, {"client": "Original"})
