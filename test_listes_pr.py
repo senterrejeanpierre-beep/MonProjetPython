@@ -30,12 +30,29 @@ class ListesPR(unittest.TestCase):
             wb.save(path)
             wb.close()
             with patch('main.ouvrir_chemin') as ouvrir, patch('main._backup_excel_before_write'):
-                open_pr(chantier)
+                self.assertTrue(open_pr(chantier))
             ouvrir.assert_called_once_with(path)
             wb = load_workbook(path)
             self.assertEqual(wb['Chiffrage']['P13'].value, '=SUM(P3:P12)')
             self.assertEqual(len(wb['Chiffrage'].data_validations.dataValidation), 2)
             wb.close()
+
+    def test_pr_verrouille_s_ouvre_sans_ecriture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chantier = Path(tmp)
+            data = chantier / 'data'
+            data.mkdir()
+            path = data / 'prix_de_revient.xlsx'
+            wb = Workbook()
+            wb.save(path)
+            wb.close()
+            avant = path.read_bytes()
+            (data / '~$prix_de_revient.xlsx').write_bytes(b'verrou Excel')
+            with patch('main.ouvrir_chemin') as ouvrir, patch('main.reparer_listes_pr') as reparer:
+                self.assertFalse(open_pr(chantier))
+            ouvrir.assert_called_once_with(path)
+            reparer.assert_not_called()
+            self.assertEqual(path.read_bytes(), avant)
 
     def test_colonnes_et_sauvegardes(self):
         for col in ('C', 'D'):

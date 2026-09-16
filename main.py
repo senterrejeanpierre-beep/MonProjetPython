@@ -1202,8 +1202,11 @@ def open_pr(chantier_dir: str | Path):
     pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     if not pr.exists():
         raise FileNotFoundError(f"PR introuvable : {pr}")
-    reparer_listes_pr(pr, _backup_excel_before_write)
+    verrouille = pr.with_name("~$" + pr.name).exists()
+    if not verrouille:
+        reparer_listes_pr(pr, _backup_excel_before_write)
     ouvrir_chemin(pr)
+    return not verrouille
 
 
 def inject_pv(chantier_dir: str | Path) -> int:
@@ -4747,7 +4750,12 @@ class HorizonChantierApp(tk.Tk):
             pr_path = _normaliser_dossier_data(dossier_chantier) / "prix_de_revient.xlsx"
             if not self._preparer_ouverture_document(pr_path):
                 return
-            open_pr(dossier_chantier)
+            listes_verifiees = open_pr(dossier_chantier)
+            if not listes_verifiees:
+                messagebox.showinfo("Prix de revient",
+                                    "PR ouvert. Un verrou Excel empêche actuellement la réparation des listes. "
+                                    "Après avoir enregistré et fermé le PR dans Excel, rouvrez-le depuis Horizon "
+                                    "Chantier si les listes sont absentes.")
             self._planifier_rappel_pdf_historique_ouverture()
         except Exception as e:
             messagebox.showerror("Prix de revient", str(e))
