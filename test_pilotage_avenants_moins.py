@@ -7,9 +7,11 @@ from main import (
     _chemin_fichier_chantier,
     _lire_revision_globale_pilotage,
     _lire_synthese_avenants_pilotage,
+    _lire_avenants_moins_publics,
     _montant_diminution_avenant,
     _reporter_quantites_cloture,
     _soumission_avant_cloture,
+    _presentation_ecarts_pilotage,
 )
 
 
@@ -30,6 +32,45 @@ def nombre_pilotage(val):
 
 
 class TestPilotageAvenantsMoins(unittest.TestCase):
+    def test_moins_publics_lus_dans_fichier_du_chantier(self):
+        with TemporaryDirectory() as tmp:
+            dossier = Path(tmp) / "Chantier déplacé"
+            dossier.mkdir()
+            wb = Workbook()
+            ws = wb.active
+            ws["B62"] = "Montant cumulé à reporter dans état"
+            ws["E62"] = -1250.5
+            wb.save(dossier / "Avenants.xlsx")
+            wb.close()
+            self.assertEqual(_lire_avenants_moins_publics(dossier / "Etat.xlsx"), 1250.5)
+            wb = Workbook()
+            ws = wb.active
+            ws["B62"], ws["E62"] = "Montant cumulé à reporter dans état", 0
+            wb.save(dossier / "Avenants.xlsx")
+            wb.close()
+            self.assertEqual(_lire_avenants_moins_publics(dossier / "Etat.xlsx"), 0)
+            wb = Workbook()
+            wb.active["B62"] = "Montant cumulé à reporter dans état"
+            wb.save(dossier / "Avenants.xlsx")
+            wb.close()
+            with self.assertRaisesRegex(ValueError, "résultat absent"):
+                _lire_avenants_moins_publics(dossier / "Etat.xlsx")
+
+    def test_ecarts_explicites_avec_deux_references(self):
+        libelle, montant, marche, initial = _presentation_ecarts_pilotage(
+            171360.60, 170240.1058, 181177.84025)
+        self.assertEqual(libelle, "Production au-delà du marché total")
+        self.assertAlmostEqual(montant, 10937.73445)
+        self.assertEqual(marche, "+10,937.73 €")
+        self.assertEqual(initial, "+9,817.24 € au-dessus")
+        libelle, montant, marche, initial = _presentation_ecarts_pilotage(100, 120, 80)
+        self.assertEqual(libelle, "Reste à facturer sur le marché total")
+        self.assertEqual(montant, 40)
+        self.assertEqual(marche, "-40.00 €")
+        self.assertEqual(initial, "-20.00 € en dessous")
+        self.assertEqual(_presentation_ecarts_pilotage(100, 100, 100)[2:],
+                         ("0.00 €", "0.00 € : égal à la soumission"))
+
     def test_cloture_preserve_soumission_et_synthese(self):
         ws = Workbook().active
         ws["R24"] = 12

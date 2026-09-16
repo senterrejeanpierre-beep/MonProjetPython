@@ -10,6 +10,7 @@ import time
 import tempfile
 import unicodedata
 import math
+import hashlib
 from copy import copy
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tkinter import ttk, messagebox, filedialog
 
 from openpyxl import load_workbook
+from listes_pr import reparer_listes_pr
 
 from bordereau_public import (feuille as _feuille_etat, est_metre as _est_metre_public,
                                lignes_postes as _postes_publics, lire_config as _config_public,
@@ -385,6 +387,26 @@ def _nombre_metier(valeur, cellule=""):
                          "Vérifiez et enregistrez le classeur dans Excel.") from None
 
 
+def _presentation_ecarts_pilotage(soumission, marche_total, production_cumulee):
+    reste = marche_total - production_cumulee
+    ecart_marche = -reste
+    if reste < 0:
+        libelle_marche = "Production au-delà du marché total"
+        valeur_marche = -reste
+    else:
+        libelle_marche = "Reste à facturer sur le marché total"
+        valeur_marche = reste
+    ecart_initial = production_cumulee - soumission
+    if ecart_initial > 0:
+        texte_initial = f"{ecart_initial:+,.2f} € au-dessus"
+    elif ecart_initial < 0:
+        texte_initial = f"{ecart_initial:+,.2f} € en dessous"
+    else:
+        texte_initial = "0.00 € : égal à la soumission"
+    texte_marche = f"{ecart_marche:+,.2f} €" if ecart_marche else "0.00 €"
+    return libelle_marche, valeur_marche, texte_marche, texte_initial
+
+
 def _article_pr(val):
     if val is None:
         return ""
@@ -411,6 +433,63 @@ def _ligne_synthese_etat(ws, ligne):
         _normaliser_libelle_excel(v).startswith(("total", "montant", "synthese", "sous-total"))
         for v in libelles if isinstance(v, str) and not v.startswith("=")
     )
+
+
+def _corriger_moins_etat_public(ws):
+    """Retire les montants contractuels d'avenants des totaux exécutés publics connus."""
+    ancienne_formule_cumulee = "=SUM('[1]Feuil1'!$D$3:$D$60)-SUM('[1]Feuil1'!$E$3:$E$60)"
+    formule_plus_cumulee = "=SUM('[1]Feuil1'!$D$3:$D$60)"
+    ancienne_formule_mois = ("=N(INDEX('[1]Feuil1'!$D$3:$D$60,1+3*($Q$9-1)))"
+                             "-N(INDEX('[1]Feuil1'!$E$3:$E$60,1+3*($Q$9-1)))")
+    ancienne_formule_plus_mois = "=N(INDEX('[1]Feuil1'!$D$3:$D$60,1+3*($Q$9-1)))"
+    ancienne_etiquette_mois = '=\"Montant de l’avenant \"&Q9'
+    for ligne in range(1, ws.max_row + 1):
+        libelle = _normaliser_libelle_excel(ws[f"P{ligne}"].value)
+        if libelle == "total des avenants cumule" and ws[f"T{ligne}"].value == ancienne_formule_cumulee:
+            ws[f"T{ligne}"] = formule_plus_cumulee
+        elif libelle == "avenants cumules en moins":
+            valeur = ws[f"T{ligne}"].value
+            if valeur not in (None, 0, "=SUM('[1]Feuil1'!$E$3:$E$60)"):
+                raise ValueError(f"Avenants en moins saisis dans l'état en T{ligne}. "
+                                 "Vérifiez cette ancienne ligne avant de recalculer.")
+            ws[f"P{ligne}"] = None
+            ws[f"T{ligne}"] = None
+        elif libelle == "total etat cumule hors tva" and ligne + 2 <= ws.max_row:
+            etiquette = ws[f"U{ligne + 1}"].value
+            if etiquette == ancienne_etiquette_mois:
+                valeur = ws[f"W{ligne + 1}"].value
+                if valeur not in (None, 0, ancienne_formule_mois, ancienne_formule_plus_mois):
+                    raise ValueError(f"Montant d'avenant saisi en W{ligne + 1}. "
+                                     "Vérifiez cette ancienne ligne avant de recalculer.")
+                ws[f"U{ligne + 1}"] = None
+                ws[f"W{ligne + 1}"] = None
+            ancien_total = f"=SUM(W{ligne}:W{ligne + 1})"
+            if ws[f"W{ligne + 2}"].value == ancien_total:
+                ws[f"W{ligne + 2}"] = f"=W{ligne}"
+
+
+def _corriger_avenants_externes_etat_prive(ws):
+    """Écarte les liens contractuels connus sans toucher aux postes d'avenant exécutés."""
+    for ligne in range(24, ws.max_row):
+        libelle = _normaliser_libelle_excel(ws[f"V{ligne}"].value)
+        if not libelle.startswith("montant de l'avenant"):
+            continue
+        valeur = ws[f"W{ligne}"].value
+        if not isinstance(valeur, str) or not valeur.startswith("="):
+            continue
+        formule = valeur.casefold()
+        lien_externe = "[1]feuil1!" in formule or "avenants!" in formule
+        if not lien_externe:
+            cellule_source = re.fullmatch(r"=sum\((m\d+)\)", formule)
+            if cellule_source:
+                source = ws[cellule_source.group(1).upper()].value
+                lien_externe = isinstance(source, str) and "avenants!" in source.casefold()
+        if not lien_externe:
+            continue
+        ws[f"V{ligne}"] = None
+        ws[f"W{ligne}"] = None
+        if ws[f"W{ligne + 1}"].value == f"=SUM(W{ligne - 1}:W{ligne})":
+            ws[f"W{ligne + 1}"] = f"=W{ligne - 1}"
 
 
 def _selectionner_etat(dossier):
@@ -446,7 +525,14 @@ def _signature_excel(chemin, verifier_verrou=True):
     if verifier_verrou and chemin.with_name("~$" + chemin.name).exists():
         raise ValueError(f"Fermez {chemin.name} dans Excel après l'avoir enregistré, puis réessayez.")
     stat = chemin.stat()
-    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+    empreinte = hashlib.sha256()
+    with chemin.open("rb") as fichier:
+        for bloc in iter(lambda: fichier.read(1024 * 1024), b""):
+            empreinte.update(bloc)
+    stat_fin = chemin.stat()
+    if (stat.st_mtime_ns, stat.st_size, stat.st_ino) != (stat_fin.st_mtime_ns, stat_fin.st_size, stat_fin.st_ino):
+        raise ValueError("Le classeur a changé pendant la lecture. Relancez l'opération.")
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino, empreinte.digest()
 
 
 def _fermer_classeur(wb):
@@ -476,8 +562,27 @@ def _sauver_excel_atomique(wb, chemin, signature):
         temporaire.unlink(missing_ok=True)
 
 
-def _charger_valeurs_excel(chemin, feuille, libelle, max_col=None, lecture_seule=True):
+def _chemin_pdf_temporaire(destination):
+    destination = Path(destination)
+    fd, nom = tempfile.mkstemp(prefix=".horizon_pdf_", suffix=".pdf", dir=destination.parent)
+    os.close(fd)
+    return Path(nom)
+
+
+def _publier_pdf_atomique(doc, elements, destination):
+    temporaire = _chemin_pdf_temporaire(destination)
+    doc.filename = str(temporaire)
+    try:
+        doc.build(elements)
+        os.replace(temporaire, destination)
+    finally:
+        temporaire.unlink(missing_ok=True)
+
+
+def _charger_valeurs_excel(chemin, feuille, libelle, max_col=None, lecture_seule=True,
+                           colonnes_formules_facultatives=()):
     """Contrôle les résultats enregistrés, sans recalculer ni écrire le classeur."""
+    signature = _signature_excel(chemin, verifier_verrou=False)
     formules = load_workbook(chemin, read_only=True, data_only=False)
     valeurs = None
     try:
@@ -487,12 +592,18 @@ def _charger_valeurs_excel(chemin, feuille, libelle, max_col=None, lecture_seule
         manquantes = []
         for row_f, row_v in zip(ws_f.iter_rows(max_col=max_col), ws_v.iter_rows(max_col=max_col)):
             for f, v in zip(row_f, row_v):
-                if v.data_type == "e" or (f.data_type == "f" and v.value is None):
+                if v.data_type == "e" or (f.data_type == "f" and v.value is None
+                                          and f.column_letter not in colonnes_formules_facultatives):
                     manquantes.append(f.coordinate)
         if manquantes:
+            if libelle == "État d'avancement":
+                # Montrer d'abord les montants T/W requis par le pilotage.
+                manquantes.sort(key=lambda adresse: (adresse[0] not in "TW", int(re.search(r"\d+", adresse).group())))
             raise ValueError(f"{libelle} : {len(manquantes)} résultat(s) Excel indisponible(s) ou en erreur "
                              f"({', '.join(manquantes[:8])}). Recalculez et enregistrez le classeur dans Excel "
                              "avant de recommencer. Aucun résultat ne peut être validé.")
+        if _signature_excel(chemin, verifier_verrou=False) != signature:
+            raise ValueError(f"{libelle} : le classeur a changé pendant la lecture. Relancez l'opération.")
         return valeurs
     except Exception:
         if valeurs is not None:
@@ -580,9 +691,21 @@ def _recalculer_etat(ws, valeurs=None):
                 raise ValueError(f"Résultat Excel absent en {adresse}. Recalculez et enregistrez l'état dans Excel.")
         return _nombre_metier(valeur, adresse)
 
-    for ligne in (_postes_publics(ws) if _est_metre_public(ws) else range(24, ws.max_row + 1)):
-        if _ligne_synthese_etat(ws, ligne) or not _article_pr(ws[f"B{ligne}"].value):
+    public = _est_metre_public(ws)
+    if public:
+        _corriger_moins_etat_public(ws)
+    else:
+        _corriger_avenants_externes_etat_prive(ws)
+    for ligne in (_postes_publics(ws) if public else range(24, ws.max_row + 1)):
+        if _ligne_synthese_etat(ws, ligne):
             continue
+        # Un poste ajouté à la main peut ne pas avoir de code numérique en B.
+        # Ses quantités saisies et son prix suffisent alors à l'identifier.
+        if not _article_pr(ws[f"B{ligne}"].value):
+            if public or not any(ws[f"{col}{ligne}"].value not in (None, "", "-", "—") for col in ("P", "Q")):
+                continue
+            if any(ws[f"{col}{ligne}"].value in (None, "", "-", "—") for col in (col_quantite, col_prix_unitaire)):
+                continue
         if all(ws[f"{col}{ligne}"].value in (None, "", "-", "—") for col in (col_quantite, col_prix_unitaire)):
             continue
         j = nombre_cellule(f"{col_quantite}{ligne}")
@@ -660,8 +783,10 @@ def _chemin_fichier_chantier(dossier_chantier: Path, nom_fichier: str) -> Path:
     return chemin
 
 
-def _montant_a_droite(ws, row, col_depart, nombre, max_ecart=3):
+def _montant_a_droite(ws, row, col_depart, nombre, max_ecart=3, requis=False):
     if not row or not col_depart:
+        if requis:
+            raise ValueError("Libellé de synthèse introuvable dans l'état d'avancement.")
         return 0
 
     for fusion in ws.merged_cells.ranges:
@@ -679,16 +804,18 @@ def _montant_a_droite(ws, row, col_depart, nombre, max_ecart=3):
 
         # Si Excel renvoie déjà un nombre, on le prend tel quel
         if isinstance(val, (int, float)):
-            return float(val)
+            return _nombre_metier(val, ws.cell(row=row, column=col).coordinate) if requis else float(val)
 
         # Sinon on passe par le parseur existant
-        num = nombre(val)
+        num = _nombre_metier(val, ws.cell(row=row, column=col).coordinate) if requis else nombre(val)
         txt = str(val).strip()
 
         # Conserve aussi un vrai zéro explicite
         if num != 0 or txt in {"0", "0,0", "0.0", "0,00", "0.00"}:
             return num
 
+    if requis:
+        raise ValueError(f"Montant de synthèse absent ou illisible à la ligne {row} de l'état d'avancement.")
     return 0
 
 
@@ -698,6 +825,25 @@ def _lire_synthese_avenants_pilotage(ws, convertir_nombre):
         _lire_montant_synthese_colonne(ws, "G", convertir_nombre)
     )
     return avenants_plus, avenants_moins
+
+
+def _lire_avenants_moins_publics(chemin_etat):
+    """Lit les moins dans Avenants.xlsx du chantier, jamais dans l'état exécuté."""
+    chemin_avenants = Path(chemin_etat).with_name("Avenants.xlsx")
+    if not chemin_avenants.is_file():
+        raise FileNotFoundError(f"Avenants.xlsx introuvable pour le pilotage : {chemin_avenants}")
+    wb = _charger_valeurs_excel(chemin_avenants, None, "Avenants", max_col=5, lecture_seule=False)
+    try:
+        ws = wb.active
+        for ligne in range(ws.max_row, 0, -1):
+            if _normaliser_libelle_excel(ws[f"B{ligne}"].value).startswith("montant cumule a reporter"):
+                cellule = ws[f"E{ligne}"]
+                if cellule.value in (None, ""):
+                    raise ValueError(f"Avenants en moins : résultat absent en {cellule.coordinate}.")
+                return abs(_nombre_metier(cellule.value, cellule.coordinate))
+        raise ValueError("Synthèse des avenants en moins introuvable dans Avenants.xlsx.")
+    finally:
+        wb.close()
 
 
 def _lire_revision_globale_pilotage(ws, convertir_nombre):
@@ -752,12 +898,16 @@ def _protect_formula_cells(wb, source_path: str | Path | None = None) -> None:
 
 
 def _prepare_excel_file_before_write(path: str | Path, keep_vba: bool = False) -> None:
-    _backup_excel_before_write(path)
     path = Path(path)
+    if Path(path).name.lower() == "prix_de_revient.xlsx":
+        reparer_listes_pr(path, _backup_excel_before_write)
+    signature = _signature_excel(path)
     wb = load_workbook(path, keep_vba=keep_vba or path.suffix.lower() == ".xlsm")
-    _protect_formula_cells(wb, path)
-    wb.save(path)
-    wb.close()
+    try:
+        _protect_formula_cells(wb, path)
+        _sauver_excel_atomique(wb, path, signature)
+    finally:
+        _fermer_classeur(wb)
 
 
 def _export_excel_to_pdf(excel_path: str | Path, pdf_path: str | Path) -> None:
@@ -1015,6 +1165,7 @@ def open_pr(chantier_dir: str | Path):
     pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     if not pr.exists():
         raise FileNotFoundError(f"PR introuvable : {pr}")
+    reparer_listes_pr(pr, _backup_excel_before_write)
     ouvrir_chemin(pr)
 
 
@@ -1913,7 +2064,7 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(
             frame_droite,
             text="💰 Prix de revient",
-            command=lambda: self._ouvrir_fichier_chantier("data/prix_de_revient.xlsx")
+            command=self.prix_revient
         ).pack(fill="x", pady=3)
 
         ttk.Button(frame_droite, text="🔍 Vérifier PR", command=self.verifier_pr).pack(fill="x", pady=3)
@@ -2169,6 +2320,16 @@ class HorizonChantierApp(tk.Tk):
             ("liste", "✅ Enregistrer le PR avant Vérifier PR ou Calcul / Reca.\n"),
             ("liste", "❌ Ne pas modifier les formules, les feuilles de bibliothèque ou les listes déroulantes.\n"),
 
+            ("section", "\n📖 Cahier technique dans le PR\n"),
+            ("texte", "Dans un PR équipé, les pages du cahier des charges sont intégrées comme images lisibles dans des onglets CSC du même classeur Excel.\n"),
+            ("liste", "✅ Sous la désignation du poste, à droite du numéro d’article, cliquer sur le lien Cahier technique.\n"),
+            ("liste", "✅ Lire les pages dans l’onglet CSC correspondant, faire défiler ou ajuster le zoom Excel si nécessaire.\n"),
+            ("liste", "✅ Cliquer sur Retour au PR en haut de l’onglet pour revenir au poste.\n"),
+            ("texte", "Le lien remplace les longs textes copiés-collés manuellement. Les photos et les saisies du poste sont conservées. Le bouton Cahier des charges technique d’Horizon ouvre toujours le PDF complet séparément.\n"),
+            ("liste", "✅ Préparer et vérifier les correspondances articles/pages pour chaque chantier dans les dossiers de travail, avant transfert sur le partage.\n"),
+            ("liste", "✅ Transférer le classeur complet : les pages et les liens internes restent dans le fichier lors de son déplacement entre Windows et macOS.\n"),
+            ("texte", "Mariemont est équipé. Ce fonctionnement est retenu pour les autres chantiers, mais leur préparation reste à effectuer chantier par chantier ; la reconnaissance et l’intégration automatiques ne sont pas encore disponibles.\n"),
+
             ("section", "\n🔍 Vérifier PR\n"),
             ("texte", "Lance le contrôle du Prix de revient enregistré.\n"),
             ("liste", "✅ À lancer après avoir enregistré le PR dans Excel.\n"),
@@ -2215,13 +2376,14 @@ class HorizonChantierApp(tk.Tk):
             ("section", "\n🧭 Pilotage\n"),
             ("texte", "Affiche ou génère la synthèse financière globale du chantier.\n"),
             ("liste", "✅ Le pilotage représente la situation financière globale du chantier.\n"),
-            ("liste", "✅ Le pilotage lit les résultats des documents spécialisés.\n"),
+            ("liste", "✅ Le pilotage lit la synthèse de l’état et les avenants en moins dans leur document séparé.\n"),
             ("liste", "✅ Il prend en compte la soumission, les avenants en plus, les avenants en moins, les révisions, la production cumulée, le reste à facturer et l’avancement financier.\n"),
             ("liste", "✅ Les avenants sont gérés dans un document séparé.\n"),
-            ("liste", "✅ Les avenants en plus sont encodés en colonne E.\n"),
-            ("liste", "✅ Les avenants en moins sont encodés en colonne G.\n"),
+            ("liste", "✅ Dans le modèle privé : avenants en plus en E, avenants en moins en G. Dans le modèle public Mariemont : en plus en D, en moins en E.\n"),
             ("liste", "✅ Les avenants servent au pilotage financier.\n"),
-            ("liste", "❌ Ils ne modifient pas la synthèse de l’état d’avancement.\n"),
+            ("liste", "✅ Les avenants en plus peuvent figurer dans la synthèse de l’état.\n"),
+            ("liste", "❌ Les avenants en moins ne figurent jamais dans l’état d’avancement ni dans sa synthèse.\n"),
+            ("liste", "❌ Un montant du fichier Avenants n'est pas une quantité exécutée : les travaux réalisés sont saisis dans les postes de l’état.\n"),
             ("liste", "❌ Le pilotage ne modifie jamais les fichiers Excel.\n"),
             ("liste", "✅ Il effectue uniquement une lecture des résultats.\n"),
             ("liste", "✅ À lancer après enregistrement et calcul des fichiers concernés.\n"),
@@ -2261,6 +2423,16 @@ class HorizonChantierApp(tk.Tk):
 
         contenu_depannage_complet = [
             ("titre", "🔧 DÉPANNAGE\n"),
+
+            ("section", "\n📖 CAHIER TECHNIQUE INTÉGRÉ AU PR\n"),
+            ("texte", "Le lien sous la désignation doit afficher un onglet CSC dans le même classeur. Retour au PR, en haut de cet onglet, ramène au poste.\n"),
+            ("liste", "✅ Si le lien est absent, vérifier que ce PR a été préparé avec les pages intégrées. L’équipement d’un chantier ne prépare pas automatiquement les autres.\n"),
+            ("liste", "✅ Si un lecteur PDF, une recherche de fichier ou une demande d’accès apparaît, vérifier que vous utilisez le lien interne du PR équipé, et non un ancien lien vers un PDF ou le bouton Cahier des charges technique d’Horizon.\n"),
+            ("liste", "✅ Si un lien ne fonctionne plus, vérifier que l’onglet CSC existe et n’a pas été renommé ou supprimé. Noter le numéro d’article pour faire corriger la correspondance.\n"),
+            ("liste", "✅ Si les pages ne correspondent pas au poste, vérifier le numéro d’article et la version du cahier technique. Après modification du PDF source, les pages intégrées doivent être mises à jour : elles ne se rafraîchissent pas automatiquement.\n"),
+            ("liste", "✅ Si le texte paraît trop petit, augmenter le zoom Excel. Les pages sont des images de consultation ; leur texte ne se modifie pas dans les cellules.\n"),
+            ("liste", "✅ Avant toute correction, enregistrer et fermer le PR, puis conserver une copie complète du classeur avec les dernières saisies et photos.\n"),
+            ("danger", "❌ Ne pas supprimer les photos, les onglets CSC ou les formules pour réparer un lien.\n"),
 
             ("section", "\n💰 PR (PRIX DE REVIENT) - FORMULES & DÉPANNAGE\n"),
             ("intro", "Cette aide rappelle les formules clés du PR et les points de contrôle à ne jamais casser.\n"),
@@ -2313,16 +2485,16 @@ class HorizonChantierApp(tk.Tk):
             ("texte", "\n---\n"),
 
             ("section", "\n💰 AVENANTS EN PLUS\n"),
-            ("liste", "✅ Les avenants en plus sont repris dans la colonne E.\n"),
-            ("liste", "✅ Vérifier que la saisie est faite dans la bonne ligne et dans la colonne E.\n"),
+            ("liste", "✅ Modèle privé : avenants en plus en colonne E. Modèle public Mariemont : colonne D.\n"),
+            ("liste", "✅ Vérifier que la saisie est faite dans la bonne ligne et la bonne colonne du modèle.\n"),
             ("danger", "❌ Ne pas déplacer les colonnes.\n"),
             ("danger", "❌ Ne pas modifier les formules liées aux avenants.\n"),
 
             ("texte", "\n---\n"),
 
             ("section", "\n💰 AVENANTS EN MOINS\n"),
-            ("liste", "✅ Les avenants en moins sont repris dans la colonne G.\n"),
-            ("liste", "✅ Vérifier que la saisie est faite dans la bonne ligne et dans la colonne G.\n"),
+            ("liste", "✅ Modèle privé : avenants en moins en colonne G. Modèle public Mariemont : colonne E.\n"),
+            ("liste", "✅ Vérifier que la saisie est faite dans la bonne ligne et la bonne colonne du modèle.\n"),
             ("danger", "⚠️ Ne pas inverser les avenants en plus et les avenants en moins.\n"),
             ("danger", "❌ Ne pas modifier les formules pour corriger un résultat.\n"),
 
@@ -2645,7 +2817,10 @@ class HorizonChantierApp(tk.Tk):
             return
 
         try:
-            wb = _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement", max_col=23, lecture_seule=False)
+            # S contient les pourcentages des postes, inutilisés par le pilotage.
+            # openpyxl efface leur cache lors du recalcul, même si les montants de synthèse restent lisibles.
+            wb = _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement", max_col=23,
+                                        lecture_seule=False, colonnes_formules_facultatives=("S",))
         except Exception as e:
             messagebox.showerror("Pilotage", str(e))
             return
@@ -2694,7 +2869,7 @@ class HorizonChantierApp(tk.Tk):
             ["total soumission hors tva"]
         )
         if ligne_soumission is None:
-            montant_sauvegarde = _soumission_avant_cloture(chemin, nombre)
+            montant_sauvegarde = _soumission_avant_cloture(chemin, _nombre_metier)
             if montant_sauvegarde is not None:
                 montant_soumission = montant_sauvegarde
             else:
@@ -2718,19 +2893,38 @@ class HorizonChantierApp(tk.Tk):
         revision, _ligne_revision, _col_revision = valeur_soumission_publique(
             ["montant de la révision", "montant de la revision"]
         )
-        revision_globale = revision
+        revision_globale, _, _ = valeur_soumission_publique(
+            ["total des révision cumulé", "total des revision cumule"]
+        )
         _montant_global, _ligne_global, _col_global = valeur_soumission_publique(
             ["montant global à facturer", "montant global a facturer"]
         )
 
+        # Ces trois valeurs pilotent tous les indicateurs : une absence ne vaut pas zéro.
+        try:
+            if ligne_soumission is not None:
+                montant_soumission = _montant_a_droite(ws, ligne_soumission, col_soumission,
+                                                       nombre, requis=True)
+            ligne_cumule = _ligne_etat_cumule if _ligne_etat_cumule is not None else ligne_execute
+            col_cumule = _col_etat_cumule if _ligne_etat_cumule is not None else col_execute
+            total_realise = _montant_a_droite(ws, ligne_cumule, col_cumule, nombre, requis=True)
+            total_mois = _montant_a_droite(ws, ligne_mois, col_mois, nombre, requis=True)
+        except ValueError as erreur:
+            wb.close()
+            messagebox.showerror("Pilotage", str(erreur))
+            return
+
         if _est_metre_public(ws) and ws["P9"].value == "Numéro de l’état":
             avenants_plus, _, _ = valeur_soumission_publique(["avenants cumulés en plus"])
-            avenants_moins, _, _ = valeur_soumission_publique(["avenants cumulés en moins"])
-            avenants_moins = abs(avenants_moins)
-            revision_globale, _, _ = valeur_soumission_publique(["total des révision cumulé"])
+            try:
+                avenants_moins = _lire_avenants_moins_publics(chemin)
+            except (FileNotFoundError, ValueError) as erreur:
+                wb.close()
+                messagebox.showerror("Pilotage", str(erreur))
+                return
         elif "Avenants" in wb.sheetnames:
             ws_avenants = wb["Avenants"]
-            avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
+            _, avenants_moins = _lire_synthese_avenants_pilotage(
                 ws_avenants,
                 nombre,
             )
@@ -2740,19 +2934,12 @@ class HorizonChantierApp(tk.Tk):
             if chemin_avenants.exists():
                 wb_avenants = _charger_valeurs_excel(chemin_avenants, None, "Avenants", max_col=7, lecture_seule=False)
                 ws_avenants = wb_avenants["Avenants"] if "Avenants" in wb_avenants.sheetnames else wb_avenants.active
-                avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
+                _, avenants_moins = _lire_synthese_avenants_pilotage(
                     ws_avenants,
                     nombre,
                 )
                 wb_avenants.close()
         total_marche = montant_soumission + avenants_plus - avenants_moins
-
-        chemin_revision_globale = Path(chemin).with_name("Revision_global.xlsx")
-        if chemin_revision_globale.exists() and not (_est_metre_public(ws) and ws["P9"].value == "Numéro de l’état"):
-            wb_revision_globale = _charger_valeurs_excel(chemin_revision_globale, None, "Révision globale", max_col=5, lecture_seule=False)
-            ws_revision_globale = wb_revision_globale.active
-            revision_globale = _lire_revision_globale_pilotage(ws_revision_globale, nombre)
-            wb_revision_globale.close()
 
         print("avenants_plus =", avenants_plus)
         print("avenants_moins =", avenants_moins)
@@ -2769,6 +2956,10 @@ class HorizonChantierApp(tk.Tk):
         production_cumulee = realise_cumule + revision_globale
         reste_a_facturer = total_marche - production_cumulee
         avancement = 0 if total_marche == 0 else (production_cumulee / total_marche) * 100
+        libelle_ecart_marche, montant_ecart_marche, ecart_marche_texte, ecart_initial_texte = _presentation_ecarts_pilotage(
+            montant_soumission, total_marche, production_cumulee)
+        montant_ecart_affiche = (f"{montant_ecart_marche:+,.2f} €" if reste_a_facturer < 0
+                                else f"{montant_ecart_marche:,.2f} €")
 
         texte_popup = f"""PILOTAGE CHANTIER
 
@@ -2785,7 +2976,9 @@ class HorizonChantierApp(tk.Tk):
     Production du mois              : {production_mois:,.2f} €
     Réalisé cumulé                  : {realise_cumule:,.2f} €
     Production cumulée              : {production_cumulee:,.2f} €
-    Reste à facturer                : {reste_a_facturer:,.2f} €
+    {libelle_ecart_marche} : {montant_ecart_affiche}
+    Écart au marché total           : {ecart_marche_texte}
+    Écart à la soumission initiale  : {ecart_initial_texte}
     Avancement                      : {avancement:.1f} %
     """
 
@@ -2871,7 +3064,7 @@ class HorizonChantierApp(tk.Tk):
             fontSize=12.2,
             leading=12.2,
             alignment=TA_RIGHT,
-            textColor=colors.HexColor("#2E7D32"),
+            textColor=colors.HexColor("#C0504D" if reste_a_facturer < 0 else "#2E7D32"),
         )
         style_bandeau = ParagraphStyle(
             "PilotageBandeau",
@@ -2938,10 +3131,11 @@ class HorizonChantierApp(tk.Tk):
         elements.append(header_table)
         elements.append(Spacer(1, 3))
 
-        valeurs_graphique = [total_marche, production_cumulee, reste_a_facturer]
-        valeurs_plot = [max(total_marche, 0), max(production_cumulee, 0), max(reste_a_facturer, 0)]
-        etiquettes_graphique = ["Marché\ntotal", "Production\ncumulée", "Reste à\nfacturer"]
-        couleurs_graphique = ["#1F4E79", "#E69138", "#70AD47"]
+        valeurs_graphique = [total_marche, production_cumulee, montant_ecart_marche]
+        valeurs_plot = [max(total_marche, 0), max(production_cumulee, 0), montant_ecart_marche]
+        etiquettes_graphique = ["Marché\ntotal", "Production\ncumulée",
+                                 "Au-delà du\nmarché" if reste_a_facturer < 0 else "Reste à\nfacturer"]
+        couleurs_graphique = ["#1F4E79", "#E69138", "#C0504D" if reste_a_facturer < 0 else "#70AD47"]
 
         fig, ax = plt.subplots(figsize=(3.1, 3.7), facecolor="white")
         barres = ax.bar(
@@ -2967,11 +3161,11 @@ class HorizonChantierApp(tk.Tk):
         ax.spines["left"].set_color("#D9E4EE")
         ax.spines["bottom"].set_color("#D9E4EE")
 
-        for barre, valeur in zip(barres, valeurs_graphique):
+        for index, (barre, valeur) in enumerate(zip(barres, valeurs_graphique)):
             ax.text(
                 barre.get_x() + barre.get_width() / 2,
                 barre.get_height() + max(marge * 0.08, 0.6),
-                f"{valeur:,.2f} €",
+                montant_ecart_affiche if index == 2 else f"{valeur:,.2f} €",
                 ha="center",
                 va="bottom",
                 fontsize=7.8,
@@ -3051,9 +3245,10 @@ class HorizonChantierApp(tk.Tk):
 
         bloc_3 = Table([
             ["RÉSULTAT", ""],
-            [Paragraph("Reste à facturer", style_libelle), Paragraph(f"{reste_a_facturer:,.2f} €", style_valeur)],
+            [Paragraph(libelle_ecart_marche, style_libelle), Paragraph(montant_ecart_affiche, style_valeur)],
             [Paragraph("Avancement", style_libelle), Paragraph(f"{avancement:.1f} %", style_valeur)],
-            [Paragraph("Écart financier final", style_libelle), Paragraph(f"{reste_a_facturer:,.2f} €", style_valeur)],
+            [Paragraph("Écart financier final sur le marché total", style_libelle), Paragraph(ecart_marche_texte, style_valeur)],
+            [Paragraph("Écart à la soumission initiale", style_libelle), Paragraph(ecart_initial_texte, style_valeur)],
         ], colWidths=largeur_blocs_gauche)
         bloc_3.hAlign = "CENTER"
         bloc_3.setStyle(TableStyle([
@@ -3071,9 +3266,9 @@ class HorizonChantierApp(tk.Tk):
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ("TOPPADDING", (0, 0), (-1, -1), 2.5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-            ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#D9EAD3")),
+            ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#FCE8E6" if reste_a_facturer < 0 else "#D9EAD3")),
             ("FONTNAME", (0, 1), (1, 1), "Helvetica-Bold"),
-            ("BACKGROUND", (0, 3), (1, 3), colors.HexColor("#D9EAD3")),
+            ("BACKGROUND", (0, 3), (1, 3), colors.HexColor("#FCE8E6" if reste_a_facturer < 0 else "#D9EAD3")),
             ("FONTNAME", (0, 3), (1, 3), "Helvetica-Bold"),
         ]))
 
@@ -3111,8 +3306,9 @@ class HorizonChantierApp(tk.Tk):
             [Paragraph("Production du mois", style_carte_label), Paragraph(f"{production_mois:,.2f} €", style_carte_valeur)],
             [Paragraph("Production cumulée", style_carte_label), Paragraph(f"{production_cumulee:,.2f} €", style_carte_valeur)],
             [Paragraph("Avancement %", style_carte_label), Paragraph(f"{avancement:.1f} %", style_carte_valeur)],
-            [Paragraph("Reste à facturer", style_carte_label), Paragraph(f"{reste_a_facturer:,.2f} €", style_carte_valeur_finale)],
-            [Paragraph("Écart financier final", style_carte_label), Paragraph(f"{reste_a_facturer:,.2f} €", style_carte_valeur_finale)],
+            [Paragraph(libelle_ecart_marche, style_carte_label), Paragraph(montant_ecart_affiche, style_carte_valeur_finale)],
+            [Paragraph("Écart financier final sur le marché total", style_carte_label), Paragraph(ecart_marche_texte, style_carte_valeur_finale)],
+            [Paragraph("Écart à la soumission initiale", style_carte_label), Paragraph(ecart_initial_texte, style_carte_valeur_finale)],
         ], colWidths=largeur_blocs_droite)
         indicateurs_table.setStyle(TableStyle([
             ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#F6F9FC")]),
@@ -3122,8 +3318,9 @@ class HorizonChantierApp(tk.Tk):
             ("RIGHTPADDING", (0, 0), (-1, -1), 3),
             ("TOPPADDING", (0, 0), (-1, -1), 2.5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-            ("BACKGROUND", (0, 4), (1, 4), colors.HexColor("#D9EAD3")),
-            ("BACKGROUND", (0, 5), (1, 5), colors.HexColor("#D9EAD3")),
+            ("BACKGROUND", (0, 4), (1, 4), colors.HexColor("#FCE8E6" if reste_a_facturer < 0 else "#D9EAD3")),
+            ("BACKGROUND", (0, 5), (1, 5), colors.HexColor("#FCE8E6" if reste_a_facturer < 0 else "#D9EAD3")),
+            ("BACKGROUND", (0, 6), (1, 6), colors.HexColor("#D9EAD3")),
         ]))
 
         indicateurs_cles = Table([
@@ -3185,7 +3382,8 @@ class HorizonChantierApp(tk.Tk):
         footer_explication = Table([
             [
                 Paragraph(
-                    f"Reste à facturer = Marché total - Production cumulée<br/>{total_marche:,.2f} € - {production_cumulee:,.2f} € = {reste_a_facturer:,.2f} €",
+                    f"{libelle_ecart_marche} = écart entre marché total et production cumulée<br/>"
+                    f"{total_marche:,.2f} € et {production_cumulee:,.2f} € : {ecart_marche_texte}",
                     style_bandeau,
                 )
             ]
@@ -3212,7 +3410,7 @@ class HorizonChantierApp(tk.Tk):
         ]))
         elements.append(footer_table)
 
-        doc.build(elements)
+        _publier_pdf_atomique(doc, elements, pdf_path)
 
         if graphique_tmp and os.path.exists(graphique_tmp):
             try:
@@ -3746,7 +3944,7 @@ class HorizonChantierApp(tk.Tk):
             ]))
             elements.append(footer_table)
 
-            doc.build(elements)
+            _publier_pdf_atomique(doc, elements, pdf_path)
 
             if graphique_tmp and os.path.exists(graphique_tmp):
                 try:
@@ -4275,7 +4473,7 @@ class HorizonChantierApp(tk.Tk):
             ]))
             elements.append(footer_table)
 
-            doc.build(elements)
+            _publier_pdf_atomique(doc, elements, pdf_path)
 
             if graphique_tmp and os.path.exists(graphique_tmp):
                 try:

@@ -213,16 +213,15 @@ def habiller_avancement(wb, modele=None):
                 style(ws.cell(debut - 2, c), 676, c)
         ligne_gauche(0, 'Total état cumulé hors TVA', somme('T', marche))
         ligne_gauche(2, 'Total du mois hors tva', f'=W{debut}')
-        ligne_gauche(4, 'Total des avenants cumulé', "=SUM('[1]Feuil1'!$D$3:$D$60)-SUM('[1]Feuil1'!$E$3:$E$60)")
+        ligne_gauche(4, 'Total des avenants cumulé', "=SUM('[1]Feuil1'!$D$3:$D$60)")
         ligne_gauche(6, '=IF(Q11="","Total exécuté au","Total exécuté au "&TEXT(Q11,"dd-mm-yyyy"))', f'=T{debut}')
         ligne_gauche(8, 'Total des révision cumulé', "=SUM('[2]Feuil1'!$D$3:$D$60)")
-        # N() convertit les tirets décoratifs des fichiers métier en zéro, sans masquer les erreurs de lien.
-        avenant = "=N(INDEX('[1]Feuil1'!$D$3:$D$60,1+3*($Q$9-1)))-N(INDEX('[1]Feuil1'!$E$3:$E$60,1+3*($Q$9-1)))"
+        # Un avenant ajuste le marché ; seuls les postes exécutés alimentent l'état du mois.
         revision = "=N(INDEX('[2]Feuil1'!$D$3:$D$60,1+3*($Q$9-1)))"
         droite = [
             ('="Montant de l’état "&Q9', somme('W', marche)),
-            ('="Montant de l’avenant "&Q9', avenant),
-            ('Montant global état hors TVA', f'=SUM(W{debut}:W{debut+1})'),
+            (None, None),
+            ('Montant global état hors TVA', f'=W{debut}'),
             ('="Montant de la TVA de "&TEXT(W9,"0%")', f'=W{debut+2}*$W$9'),
             ('="Montant de la révision sur l’état "&Q9&" hors avenant"', revision),
             ('="Montant Global à facturer état "&Q9', f'=SUM(W{debut+2}:W{debut+4})'),
@@ -240,7 +239,6 @@ def habiller_avancement(wb, modele=None):
             font = copy(ws.cell(r, col).font); font.color = '000080' if col == 23 else '0070C0'
             ws.cell(r, col).font = font
         ligne_gauche(10, 'Avenants cumulés en plus', "=SUM('[1]Feuil1'!$D$3:$D$60)")
-        ligne_gauche(11, 'Avenants cumulés en moins', "=SUM('[1]Feuil1'!$E$3:$E$60)")
         if options:
             ligne_gauche(13, 'Options hors TVA (hors marché)', somme('N', options))
             ws.row_dimensions[debut + 13].height = 30

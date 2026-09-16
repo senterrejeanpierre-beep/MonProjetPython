@@ -5,9 +5,32 @@ import zipfile
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from bordereau_public import preparer, exporter_prix, feuille, habiller_avancement
-from main import _selectionner_etat, _recalculer_etat, _reporter_quantites_cloture
+from main import _corriger_moins_etat_public, _selectionner_etat, _recalculer_etat, _reporter_quantites_cloture
 
 class BordereauPublic(unittest.TestCase):
+    def test_ancienne_synthese_publique_retire_moins_sans_effacer_saisie(self):
+        ws = Workbook().active
+        ws["P20"] = "Total des avenants cumulé"
+        ws["T20"] = "=SUM('[1]Feuil1'!$D$3:$D$60)-SUM('[1]Feuil1'!$E$3:$E$60)"
+        ws["P18"] = "Total état cumulé hors TVA"
+        ws["U19"] = '="Montant de l’avenant "&Q9'
+        ws["W19"] = ("=N(INDEX('[1]Feuil1'!$D$3:$D$60,1+3*($Q$9-1)))"
+                     "-N(INDEX('[1]Feuil1'!$E$3:$E$60,1+3*($Q$9-1)))")
+        ws["W20"] = "=SUM(W18:W19)"
+        ws["P21"] = "Avenants cumulés en moins"
+        ws["T21"] = 0
+        _corriger_moins_etat_public(ws)
+        self.assertEqual(ws["T20"].value, "=SUM('[1]Feuil1'!$D$3:$D$60)")
+        self.assertIsNone(ws["U19"].value)
+        self.assertIsNone(ws["W19"].value)
+        self.assertEqual(ws["W20"].value, "=W18")
+        self.assertIsNone(ws["P21"].value)
+        self.assertIsNone(ws["T21"].value)
+        ws["P21"], ws["T21"] = "Avenants cumulés en moins", 200
+        with self.assertRaisesRegex(ValueError, "Vérifiez"):
+            _corriger_moins_etat_public(ws)
+        self.assertEqual(ws["T21"].value, 200)
+
     def test_circuit_prix_et_avancement(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
@@ -24,14 +47,17 @@ class BordereauPublic(unittest.TestCase):
             w = load_workbook(copie); s = feuille(w)
             self.assertEqual(s['P16'].value, 'Total état cumulé hors TVA')
             self.assertEqual(s['T16'].value, '=SUM(T13)')
-            self.assertEqual(s['W18'].value, '=SUM(W16:W17)')
+            self.assertIsNone(s['U17'].value)
+            self.assertIsNone(s['W17'].value)
+            self.assertEqual(s['W18'].value, '=W16')
             self.assertEqual(s['W19'].value, '=W18*$W$9')
             self.assertEqual(s['W21'].value, '=SUM(W18:W20)')
             self.assertEqual(s['T22'].value, '=T16')  # Le mois n'est pas ajouté deux fois.
+            self.assertNotIn('$E$3', s['T20'].value)  # Les moins restent hors de l'état exécuté.
+            self.assertIsNone(s['P27'].value)  # Aucune ligne « avenants en moins » dans la synthèse.
             self.assertEqual(s['U21'].fill.fgColor.rgb[-6:], 'FFFF00')
             self.assertEqual([l.file_link.Target for l in w._external_links],
                              ['Avenants.xlsx', 'Revision_global.xlsx'])
-            self.assertIn('$Q$9', s['W17'].value)  # L'avenant suit le numéro d'état.
             self.assertIn('$Q$9', s['W20'].value)
             self.assertNotIn('676', s['W21'].value)
             s['L13'] = 12.5; s['P13'] = 1; s['Q13'] = 1

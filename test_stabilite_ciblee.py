@@ -1,4 +1,5 @@
 import unittest
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -7,7 +8,9 @@ from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 
 from main import (
-    HorizonChantierApp, _fermer_classeur, _nombre_metier,
+    HorizonChantierApp, _charger_valeurs_excel, _corriger_avenants_externes_etat_prive,
+    _fermer_classeur, _montant_a_droite,
+    _nombre_metier, _prepare_excel_file_before_write, _publier_pdf_atomique,
     _recalculer_etat, _reporter_quantites_cloture, _sauver_excel_atomique,
     _selectionner_etat, _signature_excel, _verifier_blocs_pr, ecrire_json,
 )
@@ -30,6 +33,73 @@ def etat(public=False):
 
 
 class CalculsEtat(unittest.TestCase):
+    def test_avenant_contractuel_ne_devient_pas_execute(self):
+        ws = Workbook().active
+        ws["V55"], ws["W55"] = "Montant de l'avenant état 1", "=SUM(M54)"
+        ws["M54"], ws["W56"] = "=SUM(Avenants!D62)", "=SUM(W54:W55)"
+        ws["V65"], ws["W65"] = "Montant de l'avenant état 3", "=SUM([1]Feuil1!$D$3)"
+        ws["W66"] = "=SUM(W64:W65)"
+        ws["V60"], ws["W60"] = "Montant de l'avenant état 2", "=SUM(W35:W59)"
+        _corriger_avenants_externes_etat_prive(ws)
+        self.assertIsNone(ws["V55"].value)
+        self.assertIsNone(ws["W55"].value)
+        self.assertEqual(ws["W56"].value, "=W54")
+        self.assertIsNone(ws["W65"].value)
+        self.assertEqual(ws["W66"].value, "=W64")
+        self.assertEqual(ws["W60"].value, "=SUM(W35:W59)")
+
+    def test_synthese_obligatoire_distingue_zero_et_absence(self):
+        ws = Workbook().active
+        ws["S25"], ws["T25"] = "Total du mois hors TVA", 0
+        self.assertEqual(_montant_a_droite(ws, 25, 19, _nombre_metier, requis=True), 0)
+        ws["T25"] = None
+        with self.assertRaisesRegex(ValueError, "absent ou illisible"):
+            _montant_a_droite(ws, 25, 19, _nombre_metier, requis=True)
+
+    def test_pilotage_ignore_seulement_cache_pourcentage_absent(self):
+        with TemporaryDirectory() as tmp:
+            chemin = Path(tmp) / "etat.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Bordereau"
+            ws["S25"] = '=IFERROR(R25/J25,0)'
+            ws["T25"] = 42
+            wb.save(chemin)
+            _fermer_classeur(wb)
+            valeurs = _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement",
+                                              max_col=23, colonnes_formules_facultatives=("S",))
+            self.assertEqual(valeurs["Bordereau"]["T25"].value, 42)
+            valeurs.close()
+            wb = load_workbook(chemin)
+            wb.active["T25"] = "=40+2"
+            wb.save(chemin)
+            _fermer_classeur(wb)
+            with self.assertRaisesRegex(ValueError, "T25"):
+                _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement",
+                                       max_col=23, colonnes_formules_facultatives=("S",))
+
+    def test_lecture_refuse_classeur_modifie_pendant_controle(self):
+        with TemporaryDirectory() as tmp:
+            chemin = Path(tmp) / "etat.xlsx"
+            wb = Workbook()
+            wb.active.title = "Bordereau"
+            wb.save(chemin)
+            _fermer_classeur(wb)
+            with patch("main._signature_excel", side_effect=[(1,), (2,)]):
+                with self.assertRaisesRegex(ValueError, "changé pendant la lecture"):
+                    _charger_valeurs_excel(chemin, "Bordereau", "État d'avancement")
+
+    def test_poste_ajoute_sans_code_numerique(self):
+        ws = etat().active
+        ws["B25"], ws["J25"], ws["L25"] = "Ajout A", 4, 30
+        ws["P25"], ws["Q25"] = 1, 2
+        ws["J26"], ws["L26"], ws["Q26"] = 4, 30, 2
+        ws["Q27"], ws["R27"] = "Total soumission hors TVA", 500
+        _recalculer_etat(ws)
+        self.assertEqual((ws["R25"].value, ws["T25"].value, ws["W25"].value), (3, 90, 60))
+        self.assertEqual((ws["R26"].value, ws["T26"].value, ws["W26"].value), (2, 60, 60))
+        self.assertEqual(ws["R27"].value, 500)
+
     def test_public_quantite_et_cumul_sans_double_compte(self):
         ws = etat(True).active
         ws["J24"] = "=E24*H24"
@@ -82,6 +152,20 @@ class CalculsEtat(unittest.TestCase):
 
 
 class FichiersMetier(unittest.TestCase):
+    def test_publication_pdf_preserve_ancien_en_cas_echec(self):
+        destination = Path(self.base) / "pilotage.pdf"
+        destination.write_bytes(b"ancien rapport")
+
+        class Document:
+            def build(self, _elements):
+                Path(self.filename).write_bytes(b"rapport incomplet")
+                raise OSError("génération interrompue")
+
+        with self.assertRaisesRegex(OSError, "interrompue"):
+            _publier_pdf_atomique(Document(), [], destination)
+        self.assertEqual(destination.read_bytes(), b"ancien rapport")
+        self.assertFalse(list(self.base.glob(".horizon_pdf_*")))
+
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -218,6 +302,22 @@ class FichiersMetier(unittest.TestCase):
         self.assertEqual(p.read_bytes(), avant)
         self.assertFalse(list(self.dossier.glob(".horizon_*")))
 
+    def test_preparation_classeur_sauvegarde_avant_remplacement(self):
+        p = self.dossier / "document.xlsx"
+        wb = Workbook()
+        wb.active["A1"] = "=1+2"
+        wb.save(p)
+        _fermer_classeur(wb)
+        original = p.read_bytes()
+        _prepare_excel_file_before_write(p)
+        sauvegardes = list((self.dossier / "Historique_Sauvegardes").glob("*.xlsx"))
+        self.assertEqual(len(sauvegardes), 1)
+        self.assertEqual(sauvegardes[0].read_bytes(), original)
+        wb = load_workbook(p)
+        self.assertEqual(wb.active["A1"].value, "=1+2")
+        self.assertTrue(wb.active["A1"].protection.locked)
+        _fermer_classeur(wb)
+
     def test_modification_concurrente_et_verrou_excel(self):
         p = self.creer_etat()
         signature = _signature_excel(p)
@@ -228,6 +328,15 @@ class FichiersMetier(unittest.TestCase):
         p.with_name("~$" + p.name).touch()
         with self.assertRaisesRegex(ValueError, "Fermez"):
             _signature_excel(p)
+
+    def test_signature_detecte_changement_meme_taille_et_date(self):
+        p = self.dossier / "document.xlsx"
+        p.write_bytes(b"version A")
+        signature = _signature_excel(p)
+        stat = p.stat()
+        p.write_bytes(b"version B")
+        os.utime(p, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertNotEqual(_signature_excel(p), signature)
 
     def test_verification_deuxieme_bloc_et_commentaire(self):
         ws = Workbook().active
