@@ -350,6 +350,24 @@ class FichiersMetier(unittest.TestCase):
         self.assertEqual(len(erreurs), 1)
         self.assertIn("Ligne 45", erreurs[0])
 
+    def test_pr_prix_matiere_saisi_controle_le_total_reel(self):
+        valeurs = Workbook().active
+        formules = Workbook().active
+        for ws in (valeurs, formules):
+            ws["B3"], ws["B30"] = "01.02", "RÉCAPITULATIF POSTE"
+            ws["I3"], ws["J3"], ws["H3"] = 1, 0.03, 2
+            ws["K3"] = 650
+        valeurs["L3"] = 1300
+        formules["L3"] = "=H3*K3"
+        nb, erreurs = _verifier_blocs_pr(valeurs, formules)
+        self.assertEqual((nb, erreurs), (1, []))
+        valeurs["L3"] = 1299
+        _, erreurs = _verifier_blocs_pr(valeurs, formules)
+        self.assertEqual(erreurs, ["Ligne 3 : total matière à vérifier"])
+        formules["K3"] = "=I3*(1+J3)"
+        _, erreurs = _verifier_blocs_pr(valeurs, formules)
+        self.assertIn("Ligne 3 : PU matière à vérifier", erreurs)
+
     def test_echec_fiche_json_preserve_original(self):
         p = self.base / "fiche.json"
         ecrire_json(p, {"client": "Original"})

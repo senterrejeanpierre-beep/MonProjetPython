@@ -618,8 +618,12 @@ def _charger_pr_controle(chemin):
     return _charger_valeurs_excel(chemin, "Chiffrage", "PR")
 
 
-def _verifier_blocs_pr(ws):
+def _verifier_blocs_pr(ws, ws_formules=None):
     lignes = list(ws.iter_rows(max_col=16, values_only=True))
+    lignes_k_formule = None
+    if ws_formules is not None:
+        lignes_k_formule = {ligne for ligne, (cellule,) in enumerate(
+            ws_formules.iter_rows(min_col=11, max_col=11), 1) if cellule.data_type == "f"}
     debuts = [i for i, row in enumerate(lignes, 1) if i >= 3 and _article_pr(row[1])]
     if not debuts:
         raise ValueError("Aucun bloc article détecté dans le PR.")
@@ -631,10 +635,13 @@ def _verifier_blocs_pr(ws):
             raise ValueError(f"Bloc PR incomplet à la ligne {debut}.")
         for ligne in range(debut, debut + 10):
             attendu_k = nombre(ligne, 9) * (1 + nombre(ligne, 10))
-            attendu_l = nombre(ligne, 8) * attendu_k
-            if abs(nombre(ligne, 11) - attendu_k) > 0.01:
+            pu_corrige = nombre(ligne, 11)
+            # Un prix K saisi directement est un choix de chiffrage du professionnel.
+            # Le total reste contrôlé avec le prix réellement retenu dans le PR.
+            pu_a_calculer = lignes_k_formule is None or ligne in lignes_k_formule
+            if pu_a_calculer and abs(pu_corrige - attendu_k) > 0.01:
                 erreurs.append(f"Ligne {ligne} : PU matière à vérifier")
-            if abs(nombre(ligne, 12) - attendu_l) > 0.01:
+            if abs(nombre(ligne, 12) - nombre(ligne, 8) * pu_corrige) > 0.01:
                 erreurs.append(f"Ligne {ligne} : total matière à vérifier")
         for ligne in range(debut + 13, debut + 23):
             if all(lignes[ligne - 1][col - 1] in (None, "") for col in (8, 9, 10, 11)):
@@ -2777,9 +2784,14 @@ class HorizonChantierApp(tk.Tk):
         )
         
         wb = None
+        wb_formules = None
         try:
+            signature = _signature_excel(chemin)
             wb = _charger_pr_controle(chemin)
-            nb_blocs, erreurs = _verifier_blocs_pr(wb["Chiffrage"])
+            wb_formules = load_workbook(chemin, read_only=True, data_only=False)
+            nb_blocs, erreurs = _verifier_blocs_pr(wb["Chiffrage"], wb_formules["Chiffrage"])
+            if _signature_excel(chemin) != signature:
+                raise ValueError("Le PR a changé pendant le contrôle. Relancez la vérification.")
             if erreurs:
                 messagebox.showwarning("PR", f"{len(erreurs)} écart(s) aux contrôles matière/MO sur {nb_blocs} bloc(s).\n"
                                        "Les règles particulières des postes restent à vérifier ; aucune formule n'est modifiée.\n\n"
@@ -2792,6 +2804,8 @@ class HorizonChantierApp(tk.Tk):
         finally:
             if wb is not None:
                 wb.close()
+            if wb_formules is not None:
+                wb_formules.close()
 
     def pilotage_chantier(self):
         import os
