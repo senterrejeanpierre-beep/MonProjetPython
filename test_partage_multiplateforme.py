@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from environnement_partage import trouver_base
+from environnement_partage import EmplacementNonConfigure, trouver_base
 from bordereau_public import lire_config
 from main import ouvrir_chemin, excel_set_cell_value, _selectionner_etat
 
@@ -20,16 +20,28 @@ class Partage(unittest.TestCase):
             (chantier / 'état_avancement.xlsx').touch()
             (chantier / 'bordereau_public.json').write_text(json.dumps(
                 {'original': 'métré.xlsx', 'copie': 'état_avancement.xlsx'}, ensure_ascii=False), encoding='utf-8')
-            self.assertEqual(trouver_base(projet, racine/'absent.json'), base)
+            config = racine / 'poste_initial.json'
+            config.write_text(json.dumps({'dossier': str(base)}), encoding='utf-8')
+            self.assertEqual(trouver_base(config), base)
             dest = racine/'Autre poste'; shutil.copytree(projet.parent,dest)
-            trouve = trouver_base(dest/'MonProjetPython',racine/'absent.json')
+            config_deplace = racine / 'autre_poste.json'
+            config_deplace.write_text(json.dumps({'dossier': str(dest/'Horizon_Chantier_Data')}),
+                                      encoding='utf-8')
+            trouve = trouver_base(config_deplace)
             self.assertEqual(_selectionner_etat(trouve/'Chantiers'/'004_Mariemont').name,'état_avancement.xlsx')
 
     def test_partage_deconnecte_ne_bascule_pas_sur_un_autre_chantier(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             p=Path(tmp); config=p/'poste.json'
             config.write_text(json.dumps({'dossier':str(p/'absent')}),encoding='utf-8')
-            with self.assertRaises(FileNotFoundError):trouver_base(p,config)
+            with self.assertRaises(FileNotFoundError):trouver_base(config)
+
+    def test_aucun_chemin_fixe_utilise_sans_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            projet = Path(tmp) / 'Projet'; projet.mkdir()
+            (projet.parent / 'Horizon_Chantier_Data' / 'Chantiers').mkdir(parents=True)
+            with self.assertRaises(EmplacementNonConfigure):
+                trouver_base(Path(tmp) / 'preferences_absentes.json')
 
     def test_chemins_config_portables(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,9 +68,16 @@ class Partage(unittest.TestCase):
         with patch('main.sys.platform','win32'), patch('main.os',SimpleNamespace(name='nt',startfile=start)):
             ouvrir_chemin('chantier été.xlsx')
         start.assert_called_once_with('chantier été.xlsx')
-        with patch('main.sys.platform','darwin'), patch('main.subprocess.Popen') as popen:
+        with patch('main.sys.platform','darwin'), patch('main.subprocess.run') as lancer:
             ouvrir_chemin('chantier été.xlsx')
-        popen.assert_called_once_with(['open','chantier été.xlsx'])
+        lancer.assert_called_once_with(['open','chantier été.xlsx'], check=True, capture_output=True, text=True)
+
+        from subprocess import CalledProcessError
+        with patch('main.sys.platform','darwin'), \
+             patch('main.subprocess.run', side_effect=CalledProcessError(1, ['open'], stderr='Application indisponible')), \
+             patch('main.messagebox.showerror') as erreur:
+            self.assertFalse(ouvrir_chemin('chantier été.xlsx'))
+        self.assertIn('Application indisponible', erreur.call_args.args[1])
 
     def test_excel_windows_constante_modifiable_formule_protegee(self):
         cellule=SimpleNamespace(formula='ancien texte',value='ancien texte')

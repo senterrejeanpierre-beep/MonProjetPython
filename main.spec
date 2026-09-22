@@ -1,12 +1,17 @@
 import sys
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
+_vendor = Path.cwd() / '_vendor'
+if _vendor.is_dir():
+    sys.path.insert(0, str(_vendor))
 # -*- mode: python ; coding: utf-8 -*-
 
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=[str(_vendor)] if _vendor.is_dir() else [],
     binaries=[],
-    datas=[],
+    datas=collect_data_files('tkinterdnd2'),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -43,4 +48,9 @@ if sys.platform == "darwin":
         name='Horizon Chantier.app',
         icon=None,
         bundle_identifier=None,
+        info_plist={
+            'CFBundleDevelopmentRegion': 'fr',
+            'CFBundleLocalizations': ['fr'],
+            'CFBundleAllowMixedLocalizations': True,
+        },
     )
