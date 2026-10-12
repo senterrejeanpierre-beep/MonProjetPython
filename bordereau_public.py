@@ -260,8 +260,27 @@ def completer_copie(copie, modele, sortie):
     finally:
         wb.close()
 
+def _colonnes_export(ws):
+    """Correspondance des deux formats officiels Mariemont déjà identifiés."""
+    if est_metre(ws):
+        return {'article': 'B', 'designation': 'C', 'mesurage': 'D', 'unite': 'E', 'prix': 'L'}
+    if (ws['A1'].value == 'N°' and ws['C1'].value == 'MESURAGE'
+            and ws['D1'].value == 'UNITÉ' and ws['J1'].value == 'QUANTITÉ'
+            and ws['K1'].value == 'PRIX UNITAIRES' and ws['L1'].value == 'PRIX'
+            and ws['M1'].value == 'PRIX OPTIONS'):
+        return {'article': 'A', 'designation': 'B', 'mesurage': 'C', 'unite': 'D', 'prix': 'K'}
+    return None
+
+
+def _feuille_export(wb):
+    candidates = [(ws, colonnes) for ws in wb if (colonnes := _colonnes_export(ws)) is not None]
+    if len(candidates) != 1:
+        raise ValueError("Format du métré pour l'export introuvable ou ambigu.")
+    return candidates[0]
+
+
 def exporter_prix(original, copie, sortie, empreinte):
-    """Ne change que les cellules L des postes dans le XML du fichier officiel."""
+    """Transfère les prix par article, uniquement dans les cellules officielles L ou K."""
     import math
     import re
     import zipfile
@@ -272,30 +291,37 @@ def exporter_prix(original, copie, sortie, empreinte):
     a = load_workbook(original)
     b = load_workbook(copie)
     try:
-        sa, sb = feuille(a), feuille(b)
-        ra, rb = lignes_postes(sa), lignes_postes(sb)
-        def index(ws, rows):
+        sa, ca = _feuille_export(a)
+        sb, cb = _feuille_export(b)
+        def index(ws, colonnes):
             result = {}
-            for r in rows:
-                code = str(ws[f'B{r}'].value).strip()
+            for r in range(2, ws.max_row + 1):
+                article = ws[f"{colonnes['article']}{r}"].value
+                if not article or ws[f"{colonnes['mesurage']}{r}"].value not in {'QP', 'QF', 'PG'}:
+                    continue
+                code = str(article).strip()
                 if code in result:
                     raise ValueError(f'Article en double : {code}')
                 result[code] = r
             return result
-        ia, ib = index(sa, ra), index(sb, rb)
+        ia, ib = index(sa, ca), index(sb, cb)
+        if not ia or not ib:
+            raise ValueError('Aucun article chiffrable dans le métré ou sa copie.')
         if ia.keys() != ib.keys():
             raise ValueError('Les postes de la copie et de l’original diffèrent.')
         prix = {}
         for code, r in ia.items():
             t = ib[code]
-            if any(sa[f'{col}{r}'].value != sb[f'{col}{t}'].value for col in ('C', 'D', 'E')):
+            if any(sa[f'{ca[cle]}{r}'].value != sb[f'{cb[cle]}{t}'].value
+                   for cle in ('designation', 'mesurage', 'unite')):
                 raise ValueError(f'Désignation, mesurage ou unité modifiés : {code}')
-            valeur = sb[f'L{t}'].value
+            valeur = sb[f"{cb['prix']}{t}"].value
             if isinstance(valeur, bool) or not isinstance(valeur, (int, float)) or not math.isfinite(valeur):
                 raise ValueError(f'Prix non numérique pour {code}.')
-            if sa[f'L{r}'].data_type == 'f':
-                raise ValueError(f'Formule protégée en L{r}.')
-            prix[f'L{r}'] = valeur
+            adresse = f"{ca['prix']}{r}"
+            if sa[adresse].data_type == 'f':
+                raise ValueError(f'Formule protégée en {adresse}.')
+            prix[adresse] = valeur
         with zipfile.ZipFile(original) as zin:
             ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
             book = ET.fromstring(zin.read('xl/workbook.xml'))
@@ -306,7 +332,7 @@ def exporter_prix(original, copie, sortie, empreinte):
             sheet_path = target.lstrip('/') if target.startswith('/') else 'xl/' + target
             xml = zin.read(sheet_path).decode('utf-8')
             for adresse, valeur in prix.items():
-                pattern = rf'<c\b[^>]*\br="{adresse}"[^>]*>.*?</c>'
+                pattern = rf'<c\b[^>]*\br="{adresse}"[^>]*?(?:/>|>.*?</c>)'
                 match = re.search(pattern, xml, re.S)
                 if not match:
                     raise ValueError(f'Cellule officielle introuvable : {adresse}')
@@ -314,6 +340,8 @@ def exporter_prix(original, copie, sortie, empreinte):
                 if '<f' in cell:
                     raise ValueError(f'Formule officielle protégée : {adresse}')
                 opening = cell[:cell.index('>') + 1]
+                if opening.endswith('/>'):
+                    opening = opening[:-2] + '>'
                 opening = re.sub(r'\s+t="[^"]*"', '', opening)
                 replacement = opening + '<v>' + repr(valeur) + '</v></c>'
                 xml = xml[:match.start()] + replacement + xml[match.end():]

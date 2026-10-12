@@ -161,6 +161,17 @@ class ImportBibliotheques(unittest.TestCase):
                          '191_Debroussaillage')
         self.assertEqual(_poste_pour_fichier_bibliotheque(racine / 'divers.pdf', racine, postes), '')
 
+    def test_raccordement_ne_selectionne_pas_micro_pieux(self):
+        racine = Path('/partage/Bibliotheque_Cout_securite')
+        facture = racine / '063_Raccordement_electrique_provisoire/Facture 38-23.pdf'
+        self.assertEqual(_poste_pour_fichier_bibliotheque(
+            facture, racine, ['063_Micro_pieux']), '')
+        raccordement = '060_Raccordement_électrique_provisoire'
+        self.assertEqual(_poste_pour_fichier_bibliotheque(
+            facture, racine, ['063_Micro_pieux', raccordement]), raccordement)
+        self.assertEqual(_poste_pour_fichier_bibliotheque(
+            facture, racine, [raccordement, '061_Raccordement_electrique_provisoire']), '')
+
     def test_entrees_bibliotheques_utilisent_le_meme_parcours(self):
         for methode, categorie in (
             ('ouvrir_fiches_techniques', 'Technique'),

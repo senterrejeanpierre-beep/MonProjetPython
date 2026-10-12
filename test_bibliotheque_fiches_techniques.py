@@ -6,7 +6,9 @@ from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
 
-from bibliotheque_fiches_techniques import creer_bibliotheque_classee, copier_fiche_au_chantier
+from bibliotheque_fiches_techniques import (
+    DOSSIERS_COMPLEMENTAIRES, creer_bibliotheque_classee, copier_fiche_au_chantier,
+)
 from main import HorizonChantierApp
 
 
@@ -91,8 +93,31 @@ class BibliothequeFichesTechniques(unittest.TestCase):
             (source / 'fiche.pdf').write_bytes(b'source')
             bibliotheque, categories, documents = creer_bibliotheque_classee(base)
             self.assertEqual((categories, documents), (0, 0))
-            self.assertEqual(list(bibliotheque.iterdir()), [])
+            self.assertEqual({p.name for p in bibliotheque.iterdir()}, set(DOSSIERS_COMPLEMENTAIRES))
             self.assertEqual((source / 'fiche.pdf').read_bytes(), b'source')
+
+    def test_nouvelles_rubriques_reprise_deplacement_et_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bibliotheque = base / 'Bibliotheque_Technique'
+            (bibliotheque / 'Pierre').mkdir(parents=True)
+            existant = bibliotheque / 'Pierre/fiche.pdf'
+            existant.write_bytes(b'pierre existante')
+            creer_bibliotheque_classee(base)
+            for nom in DOSSIERS_COMPLEMENTAIRES:
+                (bibliotheque / nom / 'produit.pdf').write_bytes(nom.encode())
+            creer_bibliotheque_classee(base)
+            self.assertEqual(existant.read_bytes(), b'pierre existante')
+            nouveau = base / 'Partage deplace'
+            nouveau.mkdir()
+            bibliotheque.rename(nouveau / bibliotheque.name)
+            bibliotheque, _, _ = creer_bibliotheque_classee(nouveau)
+            for nom in DOSSIERS_COMPLEMENTAIRES:
+                fiche = bibliotheque / nom / 'produit.pdf'
+                destination, ajoute = copier_fiche_au_chantier(
+                    fiche, bibliotheque, nouveau / 'Chantiers/Exemple')
+                self.assertTrue(ajoute)
+                self.assertEqual(destination.read_bytes(), nom.encode())
 
 
 

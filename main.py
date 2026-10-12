@@ -36,6 +36,9 @@ from openpyxl import load_workbook
 from documents_cout import (actualiser_liens, lire_postes, dossier_poste,
                             renommer_dossier_poste, renommer_libelle_poste)
 import liens_horizon
+import cahier_pr
+from pourcentages_pr import lier_pourcentages_pr
+from zeros_pr import completer_zeros_pr
 from listes_pr import reparer_listes_pr
 from import_jours_planning import importer_jours_pr
 from planning_soumission_contenu import preparer_copie_soumission
@@ -43,8 +46,10 @@ from bibliotheque_fiches_techniques import creer_bibliotheque_classee, copier_fi
 from bibliotheque_prix_materiaux import creer_bibliotheque as creer_bibliotheque_prix_materiaux
 from bibliotheque_prix_materiaux import trouver_offres as trouver_offres_materiaux
 from bibliotheque_prix_materiaux import importer_offres as importer_offres_materiaux
+from bibliotheque_prix_materiaux import NOM as DOSSIER_OFFRES_PRIX, EXTENSIONS as EXTENSIONS_OFFRES_PRIX
 from bibliotheque_administrative import (creer_bibliotheque_administrative,
-                                         copier_document_administratif)
+                                         copier_document_administratif, ranger_copies_secours,
+                                         dans_copies_secours, est_copie_secours)
 from avenants_soumission import lire_soumission_etat, renseigner_soumission_avenants
 
 from bordereau_public import (feuille as _feuille_etat, est_metre as _est_metre_public,
@@ -52,7 +57,7 @@ from bordereau_public import (feuille as _feuille_etat, est_metre as _est_metre_
                                exporter_prix as _exporter_prix_public)
 
 from environnement_partage import EmplacementNonConfigure, trouver_base, memoriser_base
-from factures_chantier import (DOSSIERS_FACTURES, assurer_dossiers_factures,
+from factures_chantier import (DOSSIERS_FACTURES, DOSSIERS_OFFRES, assurer_dossiers_factures,
                               preparer_dossiers_factures)
 
 APP_NAME = "Horizon Chantier"
@@ -61,10 +66,26 @@ _DOSSIER_BASE_MEMOIRE: Path | None = None
 
 def _poste_pour_fichier_bibliotheque(fichier: Path, racine: Path, postes: list[str]) -> str:
     """Retrouve le poste du chantier correspondant au dossier de la bibliothèque."""
-    numero = re.match(r"^(\d{3,})(?:_|$)", fichier.relative_to(racine).parts[0])
-    if numero is None:
+    relatif = fichier.relative_to(racine)
+    if len(relatif.parts) < 2:
         return ""
-    correspondances = [nom for nom in postes if re.match(rf"^{numero.group(1)}(?:_|$)", nom)]
+    def identite(nom):
+        match = re.fullmatch(r"(\d{3,})_(.+)", nom)
+        if match is None:
+            return None
+        texte = unicodedata.normalize("NFKD", match[2].casefold())
+        texte = "".join(c for c in texte if not unicodedata.combining(c))
+        return match[1], " ".join(re.findall(r"[^\W_]+", texte))
+
+    source = identite(relatif.parts[0])
+    if source is None:
+        return ""
+    # Un numéro peut désigner un autre métier dans un chantier renuméroté.
+    exactes = [nom for nom in postes if identite(nom) == source]
+    if len(exactes) == 1:
+        return exactes[0]
+    correspondances = [nom for nom in postes
+                       if identite(nom) is not None and identite(nom)[1] == source[1]]
     return correspondances[0] if len(correspondances) == 1 else ""
 
 
@@ -136,7 +157,8 @@ def parent_nouveau_dossier_bibliotheque(racine: Path, courant: Path, securite: b
 
 def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
                                  dossier_initial: Path, extensions: tuple[str, ...],
-                                 poste_selection: dict | None = None) -> str:
+                                 poste_selection: dict | None = None, dossiers: bool = False,
+                                 offre_selection: dict | None = None) -> str:
     """Sélecteur des fichiers de la bibliothèque générale."""
     racine = Path(racine).resolve()
     courant = Path(dossier_initial).resolve()
@@ -154,6 +176,12 @@ def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
     fenetre.transient(parent)
     cadre = ttk.Frame(fenetre, padding=12)
     cadre.pack(fill="both", expand=True)
+    categorie_offre = tk.StringVar(value=(DOSSIERS_OFFRES.get(offre_selection.get("categorie"), "")
+                                         if offre_selection is not None else ""))
+    if offre_selection is not None:
+        ttk.Label(cadre, text=f"Importer dans {offre_selection['chantier']} :").pack(anchor="w")
+        ttk.Combobox(cadre, textvariable=categorie_offre, state="readonly",
+                     values=tuple(DOSSIERS_OFFRES.values())).pack(fill="x", pady=(0, 8))
     poste = tk.StringVar(value=poste_selection.get("choix", "") if poste_selection else "")
     poste_choisi_manuellement = [False]
     if poste_selection is not None:
@@ -204,8 +232,9 @@ def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
         terme = recherche.get().strip().casefold()
         try:
             if terme:
-                entrees = sorted((p for p in racine.rglob("*") if p.is_file() and not p.is_symlink() and
-                                  p.suffix.casefold() in extensions and terme in p.name.casefold()),
+                entrees = sorted((p for p in racine.rglob("*") if not p.is_symlink() and
+                                  (p.is_file() and p.suffix.casefold() in extensions or dossiers and p.is_dir())
+                                  and terme in p.relative_to(racine).as_posix().casefold()),
                                  key=lambda p: p.relative_to(racine).as_posix().casefold())
             else:
                 entrees = sorted((p for p in dossier.iterdir() if not p.is_symlink() and
@@ -230,20 +259,34 @@ def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
         fenetre.after_idle(lambda: liste.yview_moveto(0)
                            if fenetre.winfo_exists() and not liste.selection() else None)
 
+    def destination_offre_valide() -> bool:
+        if offre_selection is None:
+            return True
+        categorie = next((cle for cle, libelle in DOSSIERS_OFFRES.items()
+                          if libelle == categorie_offre.get()), None)
+        if categorie is None:
+            messagebox.showinfo(titre, "Choisissez Matériaux, Sous-traitants ou Location de matériel.",
+                                parent=fenetre)
+            return False
+        offre_selection["categorie"] = categorie
+        return True
+
     def choisir(_event=None) -> None:
         selection = liste.selection()
         if not selection:
             return
         chemin = chemins[selection[0]]
         if chemin.is_dir():
+            recherche.set("")
             afficher(chemin)
         else:
+            if not destination_offre_valide():
+                return
             if poste_selection is not None:
                 if not poste_choisi_manuellement[0]:
                     destination = _poste_pour_fichier_bibliotheque(
                         chemin, racine, poste_selection["postes"])
-                    if destination:
-                        poste.set(destination)
+                    poste.set(destination)
                 if not poste.get():
                     messagebox.showinfo(titre, "Choisissez le poste destinataire dans le chantier.", parent=fenetre)
                     return
@@ -255,10 +298,50 @@ def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
         selection = liste.selection()
         return chemins.get(selection[0]) if selection else None
 
+    def importer_dossier() -> None:
+        chemin = fichier_selectionne()
+        if chemin is not None and chemin.is_dir() and destination_offre_valide():
+            resultat.set(str(chemin))
+            fenetre.destroy()
+
+    def importer_selection() -> None:
+        chemin = fichier_selectionne()
+        if dossiers and chemin is not None and chemin.is_dir():
+            importer_dossier()
+        else:
+            choisir()
+
+    if dossiers and offre_selection is None:
+        ttk.Button(cadre, text="Importer le dossier sélectionné", command=importer_dossier).pack(fill="x")
+
+    def ajouter_offres() -> None:
+        choix = filedialog.askopenfilenames(
+            parent=fenetre, title="Ajouter des offres à la bibliothèque générale",
+            filetypes=[("Offres", " ".join("*" + extension for extension in extensions))])
+        erreurs = []
+        for fichier in choix:
+            try:
+                source = Path(fichier)
+                if source.suffix.casefold() not in extensions:
+                    raise ValueError("Format d'offre non pris en charge.")
+                courant.resolve().relative_to(racine)
+                copier_fichier_importe(source, courant)
+            except (OSError, ValueError) as erreur:
+                erreurs.append(f"{Path(fichier).name} : {erreur}")
+        afficher(courant)
+        if erreurs:
+            messagebox.showerror(titre, "\n".join(erreurs), parent=fenetre)
+
     def modifier_selection() -> None:
         chemin = fichier_selectionne()
-        if chemin is not None and chemin.is_file():
+        if chemin is not None and chemin.is_dir():
+            recherche.set("")
+            afficher(chemin)
+        elif chemin is not None and chemin.is_file():
             ouvrir_chemin(chemin)
+
+    if dossiers:
+        ttk.Button(ligne_haut, text="Ouvrir le dossier", command=modifier_selection).pack(side="left", padx=8)
 
     def renommer_selection() -> None:
         chemin = fichier_selectionne()
@@ -411,7 +494,9 @@ def choisir_fichier_bibliotheque(parent, titre: str, racine: Path,
     liste.bind("<Control-Button-1>", afficher_menu)
     commandes = ttk.Frame(cadre)
     commandes.pack(fill="x", pady=(8, 0))
-    ttk.Button(commandes, text="Importer dans le chantier", command=choisir).pack(side="left")
+    if offre_selection is not None:
+        ttk.Button(commandes, text="Ajouter des offres", command=ajouter_offres).pack(side="left", padx=(0, 8))
+    ttk.Button(commandes, text="Importer dans le chantier", command=importer_selection).pack(side="left")
     ttk.Button(commandes, text="Ouvrir / modifier", command=modifier_selection).pack(side="left", padx=8)
     ttk.Button(commandes, text="Actualiser", command=actualiser).pack(side="left")
     ttk.Button(commandes, text="Ajouter un dossier numéroté",
@@ -531,6 +616,28 @@ def choisir_fichier_a_importer(parent, titre: str, dossier_initial: Path) -> Pat
     fenetre.grab_set()
     fenetre.wait_window()
     return resultat[0] if resultat else None
+
+
+def copier_offre_bibliotheque(source: Path, dossier: Path) -> Path:
+    """Copie indépendante d'un dossier fournisseur, sans écraser le chantier."""
+    source, dossier = Path(source), Path(dossier)
+    if source.is_symlink():
+        raise ValueError("Choisissez un fichier ou dossier sans lien symbolique.")
+    if not source.is_dir():
+        return copier_fichier_importe(source, dossier)[0]
+    if any(p.is_symlink() for p in source.rglob("*")):
+        raise ValueError("Ce dossier contient un lien symbolique ; importez les documents directement.")
+    dossier.mkdir(parents=True, exist_ok=True)
+    cible = dossier / source.name
+    numero = 2
+    while cible.exists():
+        cible = dossier / f"{source.name}_{numero}"
+        numero += 1
+    with tempfile.TemporaryDirectory(dir=dossier, prefix=".import_offre_") as temporaire:
+        copie = Path(temporaire) / source.name
+        shutil.copytree(source, copie)
+        copie.rename(cible)
+    return cible
 
 
 def copier_fichier_importe(source: Path, dossier: Path) -> tuple[Path, bool]:
@@ -1116,6 +1223,50 @@ def _selectionner_etat(dossier):
                      "Conservez l'état à utiliser ou renseignez le type dans la fiche chantier.")
 
 
+def _etats_avancement_disponibles(dossier):
+    dossier = Path(dossier)
+    etats = [("Travaux principaux", _selectionner_etat(dossier))]
+    for sous_dossier in dossier.iterdir():
+        if (unicodedata.normalize("NFC", sous_dossier.name).casefold() ==
+                "supplément aux travaux principaux" and sous_dossier.is_dir()):
+            if any(p.is_file() and not p.name.startswith("~$")
+                   for p in sous_dossier.glob("Etat_avancement*.xlsm")):
+                etats.append(("Supplément aux travaux principaux", _selectionner_etat(sous_dossier)))
+    return etats
+
+
+def _choisir_etat_avancement(parent, dossier, action):
+    etats = _etats_avancement_disponibles(dossier)
+    if len(etats) == 1:
+        return etats[0][1]
+    choix = None
+    fenetre = tk.Toplevel(parent)
+    fenetre.withdraw()
+    fenetre.title(action)
+    fenetre.transient(parent)
+    fenetre.resizable(False, False)
+    cadre = ttk.Frame(fenetre, padding=16)
+    cadre.pack(fill="both", expand=True)
+    ttk.Label(cadre, text="Quel état d’avancement ?").pack(pady=(0, 10))
+    def selectionner(chemin):
+        nonlocal choix
+        choix = chemin
+        fenetre.destroy()
+    for libelle, chemin in etats:
+        ttk.Button(cadre, text=libelle, command=lambda p=chemin: selectionner(p)).pack(fill="x", pady=3)
+    ttk.Button(cadre, text="Annuler", command=fenetre.destroy).pack(fill="x", pady=(10, 0))
+    fenetre.bind("<Escape>", lambda _event: fenetre.destroy())
+    fenetre.protocol("WM_DELETE_WINDOW", fenetre.destroy)
+    fenetre.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - fenetre.winfo_reqwidth()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - fenetre.winfo_reqheight()) // 2
+    fenetre.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    fenetre.deiconify()
+    fenetre.grab_set()
+    parent.wait_window(fenetre)
+    return choix
+
+
 def _signature_excel(chemin, verifier_verrou=True):
     chemin = Path(chemin)
     if verifier_verrou and chemin.with_name("~$" + chemin.name).exists():
@@ -1396,6 +1547,9 @@ def _normaliser_dossier_data(dossier_chantier: Path) -> Path:
 
 
 def _chemin_fichier_chantier(dossier_chantier: Path, nom_fichier: str) -> Path:
+    if nom_fichier == 'Cahier_technique.pdf':
+        return (cahier_pr.ranger_cahier(dossier_chantier)
+                or dossier_chantier / 'data' / nom_fichier)
     if Path(nom_fichier).parts and Path(nom_fichier).parts[0].strip() == "data":
         _normaliser_dossier_data(dossier_chantier)
 
@@ -1798,6 +1952,11 @@ def open_pr(chantier_dir: str | Path):
     pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     if not pr.exists():
         raise FileNotFoundError(f"PR introuvable : {pr}")
+    if not pr.with_name('~$' + pr.name).exists():
+        completer_zeros_pr(pr, _backup_excel_before_write)
+        lier_pourcentages_pr(pr, _backup_excel_before_write)
+        cahier_pr.ranger_cahier(chantier)
+        cahier_pr.assurer_liens(chantier, pr, _backup_excel_before_write)
     ouvrir_chemin(pr)
     return False
 
@@ -1989,11 +2148,20 @@ def _creer_documents_chantier(base: Path, nom: str, chantier: dict) -> Path:
             return []
 
         shutil.copytree(modeles, preparation, ignore=ignorer_etats)
+        # Le cahier d'un chantier ne fait pas partie des documents communs.
+        cahier_modele = cahier_pr.trouver_cahier(preparation)
+        if cahier_modele is not None:
+            cahier_modele.unlink(missing_ok=True)
+        for dossier_cache in (preparation / 'data' / '.cahier_pages',
+                              preparation / 'data' / 'Cahier_technique_articles'):
+            if dossier_cache.is_dir():
+                shutil.rmtree(dossier_cache)
         planning_soumission = preparation / 'Planning_soumission.xlsx'
         if planning_soumission.is_file():
             preparer_copie_soumission(planning_soumission, nom,
                                       chantier.get('client', ''), chantier.get('adresse', ''))
         (preparation / liens_horizon.MARQUEUR).unlink(missing_ok=True)
+        (preparation / cahier_pr.CONFIG).unlink(missing_ok=True)
         # Les pièces liées depuis le coût de chantier restent avec leurs documents.
         (preparation / "Documents_installation").mkdir(exist_ok=True)
         cout = next((p for p in preparation.iterdir()
@@ -2022,6 +2190,10 @@ def _creer_documents_chantier(base: Path, nom: str, chantier: dict) -> Path:
             if pr is None:
                 raise FileNotFoundError(f"Modèle de prix de revient introuvable dans : {modeles}")
             shutil.copy2(pr, data / "prix_de_revient.xlsx")
+        completer_zeros_pr(data / "prix_de_revient.xlsx")
+        lier_pourcentages_pr(data / "prix_de_revient.xlsx")
+        cahier_pr.retirer_cahier_du_modele(data / "prix_de_revient.xlsx")
+        cahier_pr.assurer_liens(preparation, data / "prix_de_revient.xlsx")
         json_temp = Path(temporaire) / "chantier.json"
         ecrire_json(json_temp, chantier)
         # Un dossier strictement vide peut provenir d'une ancienne tentative ratée.
@@ -2314,7 +2486,7 @@ class HorizonChantierApp(tk.Tk):
         super().__init__()
         self.title(APP_NAME)
         largeur = min(1680, int(self.winfo_screenwidth() * 0.88))
-        hauteur = min(1060, int(self.winfo_screenheight() * 0.85))
+        hauteur = min(1200, int(self.winfo_screenheight() * 0.94), self.winfo_screenheight() - 80)
         self.geometry(f"{largeur}x{hauteur}"
                       f"+{(self.winfo_screenwidth() - largeur) // 2}"
                       f"+{(self.winfo_screenheight() - hauteur) // 2}")
@@ -2363,6 +2535,9 @@ class HorizonChantierApp(tk.Tk):
                             break
                     if not trouve:
                         raise ValueError("Ce chantier n’est pas disponible dans la liste Horizon.")
+                    if liens_horizon.est_lien_cahier(lien):
+                        self.ouvrir_pages_cahier_pr(chantier, numero)
+                        continue
                     classeur = _chemin_fichier_chantier(chantier, "Cout_securite.xlsx")
                     poste = next((p for p in lire_postes(classeur)
                                   if re.match(r'^\d+', p['libelle']).group() == numero), None)
@@ -2383,13 +2558,143 @@ class HorizonChantierApp(tk.Tk):
                     fenetre.focus_force()
                     fenetre.after(1200, lambda f=fenetre: f.attributes('-topmost', False) if f.winfo_exists() else None)
                 except (OSError, ValueError) as erreur:
-                    messagebox.showerror("Documents du coût", str(erreur), parent=self)
+                    messagebox.showerror("Documents du chantier", str(erreur), parent=self)
         finally:
             self.after(500, self._recevoir_liens_documents)
 
     def report_callback_exception(self, exc_type, exc_value, traceback):
         super().report_callback_exception(exc_type, exc_value, traceback)
         messagebox.showerror("Opération interrompue", str(exc_value), parent=self)
+
+    def ouvrir_pages_cahier_pr(self, chantier, article):
+        """Le même lien PR laisse l'utilisateur choisir les pages de son propre PDF."""
+        chantier = Path(chantier)
+        pr = _normaliser_dossier_data(chantier) / 'prix_de_revient.xlsx'
+        poste = next((p for p in cahier_pr.lire_postes(pr) if p['article'] == article), None)
+        if poste is None:
+            raise ValueError('Cet article ne figure plus dans le PR du chantier.')
+        pdf = cahier_pr.trouver_cahier(chantier)
+        if pdf and pdf.is_file():
+            saisie, change = cahier_pr.choix_article(chantier, article, pdf)
+
+            if not saisie and not change:
+                saisie = cahier_pr.pages_article_automatiques(
+                    pdf, article,
+                    [p['article'] for p in cahier_pr.lire_postes(pr)])
+
+            if saisie:
+                extrait = cahier_pr.preparer_pages(
+                    chantier, article, pdf, saisie
+                )
+                ouvrir_chemin(extrait)
+                return
+
+        win = tk.Toplevel(self)
+        win.title(f'Cahier — {chantier.name} — {article}')
+        win.transient(self)
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text=f"{article} — {poste['designation']}", wraplength=620).pack(anchor='w', pady=(0, 10))
+        source = {'pdf': cahier_pr.trouver_cahier(chantier)}
+        nom = tk.StringVar(win)
+        information = tk.StringVar(win)
+        pages = tk.StringVar(win)
+        ttk.Label(frame, textvariable=nom, wraplength=620).pack(anchor='w')
+
+        def actualiser():
+            pdf = source['pdf']
+            nom.set(f'Cahier : {pdf.name}' if pdf else 'Aucun cahier chargé dans ce chantier.')
+            pages.set('')
+            if pdf and pdf.is_file():
+                try:
+                    nombre = cahier_pr.nombre_pages(pdf)
+                    saisie, change = cahier_pr.choix_article(chantier, article, pdf)
+                    pages.set(saisie)
+                    information.set(f'{nombre} pages dans le PDF.' +
+                        (' Le cahier a changé : indiquez les nouvelles pages.' if change else ''))
+                except Exception as erreur:
+                    information.set(str(erreur))
+            else:
+                information.set('Chargez le cahier PDF de ce chantier.')
+
+        def charger():
+            choix = filedialog.askopenfilename(parent=win, title='Charger le cahier du chantier',
+                initialdir=str(chantier / 'data'), filetypes=[('Cahier PDF', '*.pdf')])
+            if not choix:
+                return
+            try:
+                fichier = cahier_pr.ranger_cahier(chantier, Path(choix))
+                source['pdf'] = fichier
+                actualiser()
+            except Exception as erreur:
+                messagebox.showerror('Cahier', str(erreur), parent=win)
+
+        def ouvrir_complet():
+            if source['pdf'] and source['pdf'].is_file():
+                ouvrir_chemin(source['pdf'])
+            else:
+                charger()
+
+        def ouvrir_pages():
+            try:
+                if not source['pdf'] or not source['pdf'].is_file():
+                    raise ValueError('Chargez d’abord le cahier PDF du chantier.')
+
+                extrait = cahier_pr.preparer_pages(
+                    chantier,
+                    article,
+                    source['pdf'],
+                    pages.get()
+                )
+
+                ouvrir_chemin(extrait)
+
+            except Exception as erreur:
+                messagebox.showerror(
+                    'Pages du cahier',
+                    str(erreur),
+                    parent=win
+                )
+        def supprimer_choix():
+            config = cahier_pr.lire_config(chantier)
+            articles = config.setdefault('articles', {})
+            articles.pop(str(article), None)
+
+            config_path = chantier / cahier_pr.CONFIG
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + '\n',
+                encoding='utf-8'
+            )
+
+            pages.set('')
+            information.set('Choix supprimé. Indiquez les nouvelles pages.')
+            saisie.focus_set()
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill='x', pady=8)
+        ttk.Button(
+            actions,
+            text='Supprimer le choix',
+            command=supprimer_choix
+        ).pack(side='right')
+        ttk.Button(actions, text='Charger un cahier…', command=charger).pack(side='left')
+        ttk.Button(actions, text='Voir le cahier complet', command=ouvrir_complet).pack(side='left', padx=8)
+        ttk.Label(frame, textvariable=information, wraplength=620).pack(anchor='w', pady=(0, 10))
+        ttk.Label(frame, text='Pages du PDF (exemple : 30-32, 35)').pack(anchor='w')
+        saisie = ttk.Entry(frame, textvariable=pages, width=45)
+        saisie.pack(fill='x', pady=(4, 4))
+        ttk.Label(frame, text='Utilisez les numéros du lecteur PDF, à partir de 1.', wraplength=620).pack(anchor='w')
+        bas = ttk.Frame(frame)
+        bas.pack(fill='x', pady=(14, 0))
+        ttk.Button(bas, text='Ouvrir les pages', command=ouvrir_pages).pack(side='left')
+        ttk.Button(bas, text='Fermer', command=win.destroy).pack(side='right')
+        saisie.bind('<Return>', lambda _e: ouvrir_pages())
+        actualiser()
+        self.deiconify()
+        win.lift()
+        win.attributes('-topmost', True)
+        win.after(1200, lambda: win.attributes('-topmost', False) if win.winfo_exists() else None)
+        saisie.focus_set()
 
     def _nom_chantier_selectionne(self) -> str | None:
         sel = self.tree.selection()
@@ -2413,6 +2718,16 @@ class HorizonChantierApp(tk.Tk):
         if self._doit_rappeler_pdf_historique(chemin):
             self._planifier_rappel_pdf_historique_ouverture()
 
+    def ouvrir_metre_original(self) -> None:
+        if not self._nom_chantier_selectionne():
+            return
+        try:
+            config = _config_public(self._dossier_chantier_selectionne())
+            nom = config["original"] if config is not None else "Metre_detaille.pdf"
+            self._ouvrir_fichier_chantier(nom)
+        except (OSError, ValueError, KeyError, TypeError) as erreur:
+            messagebox.showerror("Métré original", str(erreur), parent=self)
+
     def choisir_planning_chantier(self) -> None:
         if not self._nom_chantier_selectionne():
             return
@@ -2433,7 +2748,11 @@ class HorizonChantierApp(tk.Tk):
             fenetre.destroy()
             self.importer_jours_planning_soumission()
 
-        ttk.Button(cadre, text="Soumission", command=lambda: ouvrir("Planning_soumission.xlsx")
+        def soumission():
+            fenetre.destroy()
+            self.ouvrir_planning_soumission_pr()
+
+        ttk.Button(cadre, text="Soumission", command=soumission
                    ).pack(fill="x", pady=2)
         ttk.Button(cadre, text="Exécution", command=lambda: ouvrir("Planning_execution.xlsx")
                    ).pack(fill="x", pady=2)
@@ -2453,27 +2772,23 @@ class HorizonChantierApp(tk.Tk):
         fenetre.grab_set()
         fenetre.focus_set()
 
-    def importer_jours_planning_soumission(self) -> None:
+    def ouvrir_planning_soumission_pr(self, actualiser=False) -> None:
+        from planning_soumission_pr import assurer_planning_soumission
+        nom = self._nom_chantier_selectionne()
+        if not nom:
+            return
         dossier = self._dossier_chantier_selectionne()
-        pr = _normaliser_dossier_data(dossier) / 'prix_de_revient.xlsx'
-        planning = dossier / 'Planning_soumission.xlsx'
-        if not pr.is_file() or not planning.is_file():
-            messagebox.showerror('Import des jours', 'Le PR ou le planning de soumission est introuvable.', parent=self)
-            return
+        destination = dossier / 'Planning_soumission.xlsx'
         try:
-            fiche = lire_json(self._chemin_chantier_selectionne())
-            nombre, manquants, _ = importer_jours_pr(
-                pr, planning, _backup_excel_before_write,
-                nom=fiche.get('nom', fiche.get('chantier', '')),
-                client=fiche.get('client', ''), adresse=fiche.get('adresse', ''))
-        except (OSError, ValueError, KeyError) as erreur:
-            messagebox.showerror('Import des jours', str(erreur), parent=self)
-            return
-        texte = f'{nombre} article(s) reporté(s) dans le planning de soumission.'
-        if manquants:
-            texte += f'\n{manquants} résultat(s) de jours sont vides dans le PR enregistré.'
-        messagebox.showinfo('Import des jours', texte, parent=self)
-        self._ouvrir_fichier_chantier('Planning_soumission.xlsx')
+            destination = assurer_planning_soumission(
+                _normaliser_dossier_data(dossier) / 'prix_de_revient.xlsx', destination, nom,
+                dossier_base() / 'logo_jt_bati.png', _backup_excel_before_write, actualiser=actualiser)
+            self._ouvrir_fichier_chantier(destination.name)
+        except (OSError, ValueError) as erreur:
+            messagebox.showerror('Planning de soumission', str(erreur), parent=self)
+
+    def importer_jours_planning_soumission(self) -> None:
+        self.ouvrir_planning_soumission_pr(actualiser=True)
 
     def ouvrir_avenants(self) -> None:
         if not self._nom_chantier_selectionne():
@@ -2640,11 +2955,15 @@ class HorizonChantierApp(tk.Tk):
     def _ouvrir_documents_chantier(self, categorie: str, poste_initial: str | None = None,
                                    factures_type: str | None = None) -> None:
         """Présente les documents du chantier de la même façon pour chaque dossier."""
+        if categorie == DOSSIER_OFFRES_PRIX:
+            self.ouvrir_bibliotheque_prix_materiaux()
+            return
         nom_chantier = self._nom_chantier_selectionne()
         if not nom_chantier:
             return
         dossier = self._dossier_chantier_selectionne() / categorie
         dossier.mkdir(exist_ok=True)
+        est_offre = categorie == DOSSIER_OFFRES_PRIX or categorie in DOSSIERS_OFFRES
         attribut_fenetre = f"_fenetre_{categorie.lower()}"
         attribut_dossier = f"{attribut_fenetre}_dossier"
         attribut_rafraichir = f"_rafraichir_{categorie.lower()}"
@@ -2662,7 +2981,9 @@ class HorizonChantierApp(tk.Tk):
             existante.destroy()
 
         fenetre = tk.Toplevel(self)
-        libelle_categorie = "Coût de la sécurité" if categorie == "Documents_installation" else categorie
+        libelle_categorie = (f"Offres — {DOSSIERS_OFFRES[categorie]}" if categorie in DOSSIERS_OFFRES else
+                             "Anciennes offres à classer" if categorie == DOSSIER_OFFRES_PRIX else
+                             "Coût de la sécurité" if categorie == "Documents_installation" else categorie)
         fenetre.title(f"{libelle_categorie} du chantier — {nom_chantier}")
         fenetre.geometry(f"{min(1100, fenetre.winfo_screenwidth() - 80)}x"
                          f"{min(650, fenetre.winfo_screenheight() - 100)}")
@@ -2719,16 +3040,24 @@ class HorizonChantierApp(tk.Tk):
 
         def rafraichir():
             nonlocal contenu_affiche
+            if categorie == "Administratif":
+                try:
+                    ranger_copies_secours(dossier)
+                except (OSError, ValueError) as erreur:
+                    messagebox.showwarning("Copies de secours",
+                                           f"Certaines copies restent à ranger :\n{erreur}", parent=fenetre)
             for ligne in liste.get_children():
                 liste.delete(ligne)
             chemins.clear()
             fichiers = sorted((p for p in dossier.rglob("*") if p.is_file() and
+                               not (categorie == "Administratif" and dans_copies_secours(p.relative_to(dossier))) and
                                not any(part.startswith((".", "~$"))
                                        for part in p.relative_to(dossier).parts)),
                               key=lambda p: p.relative_to(dossier).as_posix().casefold())
             contenu_affiche = tuple((p.relative_to(dossier).as_posix(), p.stat().st_mtime_ns)
                                     for p in fichiers)
-            visibles = [p for p in fichiers if recherche.get().strip().casefold()
+            visibles = [p for p in fichiers if not (categorie == "Administratif" and est_copie_secours(p.relative_to(dossier)))
+                        and recherche.get().strip().casefold()
                         in p.relative_to(dossier).as_posix().casefold()]
             if categorie == "Documents_installation":
                 visibles = [p for p in visibles if p.relative_to(dossier).parts[0] == poste_cout.get()]
@@ -2754,6 +3083,7 @@ class HorizonChantierApp(tk.Tk):
             try:
                 actuel = tuple((p.relative_to(dossier).as_posix(), p.stat().st_mtime_ns)
                                for p in sorted((p for p in dossier.rglob("*") if p.is_file() and
+                                                not (categorie == "Administratif" and dans_copies_secours(p.relative_to(dossier))) and
                                                 not any(part.startswith((".", "~$"))
                                                         for part in p.relative_to(dossier).parts)),
                                                key=lambda p: p.relative_to(dossier).as_posix().casefold()))
@@ -2781,16 +3111,12 @@ class HorizonChantierApp(tk.Tk):
                 return dossier / sous_dossier_facture
             return dossier
 
-        def ajouter_factures(sources):
-            choix = type_factures.get()
-            if choix not in DOSSIERS_FACTURES:
-                messagebox.showinfo("Factures", "Choisissez d'abord une catégorie de factures.", parent=fenetre)
-                return
+        def ajouter_fichiers(sources):
             ajoutes = deja_presents = 0
             erreurs = []
             for source in sources:
                 try:
-                    _, ajoute = copier_fichier_importe(Path(source), dossier_destination(choix))
+                    _, ajoute = copier_fichier_importe(Path(source), dossier_destination())
                     ajoutes += bool(ajoute)
                     deja_presents += not ajoute
                 except (OSError, ValueError) as erreur:
@@ -2798,18 +3124,22 @@ class HorizonChantierApp(tk.Tk):
             rafraichir()
             etat.set(f"{ajoutes} fichier(s) ajouté(s), {deja_presents} déjà présent(s).")
             if erreurs:
-                messagebox.showerror("Factures", "Importation impossible :\n" + "\n".join(erreurs),
+                messagebox.showerror("Importation", "Importation impossible :\n" + "\n".join(erreurs),
                                      parent=fenetre)
 
+        def choisir_dans_chantier():
+            source = choisir_fichier_a_importer(
+                fenetre, f"Importer dans {libelle_categorie} du chantier", dossier.parent)
+            if source is not None:
+                ajouter_fichiers((source,))
+
         def importer_fichier():
-            if categorie == "Factures":
-                if type_factures.get() not in DOSSIERS_FACTURES:
-                    messagebox.showinfo("Factures", "Choisissez d'abord une catégorie de factures.", parent=fenetre)
-                    return
-                choix = filedialog.askopenfilenames(parent=fenetre, title="Ajouter des factures",
-                                                    initialdir=str(dossier.parent))
+            if (categorie == "Factures" or est_offre):
+                choix = filedialog.askopenfilenames(
+                    parent=fenetre, title=f"Importer dans {libelle_categorie}",
+                    initialdir=str(dossier.parent))
                 if choix:
-                    ajouter_factures(choix)
+                    ajouter_fichiers(choix)
                 return
             if categorie == "Documents_installation":
                 choix = filedialog.askopenfilename(
@@ -2876,6 +3206,65 @@ class HorizonChantierApp(tk.Tk):
             threading.Thread(target=travail, daemon=True).start()
             fenetre.after(100, verifier_resultat)
 
+        def envoyer_dossier_administratif():
+            from dossier_administratif_pdf import generer_pdf_dossier
+            from mail_soumission import ouvrir_gmail_soumission
+
+            destination = dossier.parent / "Dossier_administratif_soumission.pdf"
+            # Conserver également les PDF préparés lors des envois précédents.
+            numero = 2
+            while destination.exists():
+                destination = dossier.parent / f"Dossier_administratif_soumission_{numero}.pdf"
+                numero += 1
+            bouton_mail.configure(state="disabled")
+            etat.set("Préparation du PDF de tout le dossier administratif…")
+            resultats = queue.Queue(maxsize=1)
+
+            def convertir_excel(source, pdf):
+                if sys.platform != "win32":
+                    return _export_excel_to_pdf(source, pdf)
+                # Excel est appelé dans le fil de préparation, pas dans celui de Tk.
+                import pythoncom
+                pythoncom.CoInitialize()
+                try:
+                    _export_excel_to_pdf(source, pdf)
+                finally:
+                    pythoncom.CoUninitialize()
+
+            def travail():
+                try:
+                    nombre = generer_pdf_dossier(
+                        dossier, destination, convertir_word=convertir_word_en_pdf_chantier,
+                        convertir_excel=convertir_excel)
+                    resultats.put((nombre, None))
+                except Exception as erreur:
+                    resultats.put((None, str(erreur)))
+
+            def verifier_resultat():
+                if not fenetre.winfo_exists():
+                    return
+                try:
+                    nombre, erreur = resultats.get_nowait()
+                except queue.Empty:
+                    fenetre.after(100, verifier_resultat)
+                    return
+                bouton_mail.configure(state="normal")
+                if erreur:
+                    etat.set("Préparation du mail interrompue.")
+                    messagebox.showerror("Dossier administratif", erreur, parent=fenetre)
+                    return
+                etat.set(f"{nombre} document(s) regroupé(s). Glissez {destination.name} "
+                         "dans Gmail, puis choisissez le destinataire et envoyez.")
+                try:
+                    ouvrir_gmail_soumission(destination, nom_chantier)
+                except Exception as erreur:
+                    messagebox.showwarning(
+                        "PDF prêt", f"Le PDF a été créé :\n{destination}\n\n{erreur}\n\n"
+                        "Joignez ce PDF à votre message dans Gmail.", parent=fenetre)
+
+            threading.Thread(target=travail, daemon=True).start()
+            fenetre.after(100, verifier_resultat)
+
         def renommer_selection():
             selection = liste.selection()
             if not selection:
@@ -2932,7 +3321,7 @@ class HorizonChantierApp(tk.Tk):
             try:
                 liste.drop_target_register(DND_FILES)
                 def deposer_factures(evenement):
-                    ajouter_factures(self.tk.splitlist(evenement.data))
+                    ajouter_fichiers(self.tk.splitlist(evenement.data))
                     return "copy"
                 liste.dnd_bind("<<Drop>>", deposer_factures)
                 ttk.Label(cadre, text="Glissez vos fichiers téléchargés sur la liste pour les copier ici.").pack(
@@ -2951,40 +3340,85 @@ class HorizonChantierApp(tk.Tk):
         ligne_dossier.pack(fill="x")
         ttk.Button(ligne_documents, text="Ouvrir le document",
                    command=ouvrir_selection).pack(side="left")
-        ajouter = (ajouter_document_cout if categorie == "Documents_installation" else
+        ajouter = ((lambda: self.choisir_offre_prix_chantier(categorie)) if est_offre else
+                   ajouter_document_cout if categorie == "Documents_installation" else
                    self.choisir_document_administratif_chantier if categorie == "Administratif"
                    else self.choisir_fiche_technique_chantier)
         if categorie != "Factures":
             ttk.Button(ligne_documents, text="Ajouter depuis la bibliothèque",
                        command=ajouter).pack(side="left", padx=8)
-        if categorie == "Factures":
-            ttk.Button(ligne_documents, text="Ajouter des fichiers",
-                       command=importer_fichier).pack(side="left", padx=(0, 8))
-        else:
+        if not est_offre:
             ttk.Button(ligne_documents, text="Importer un fichier",
                        command=importer_fichier).pack(side="left", padx=(0, 8))
+        if categorie == "Factures":
+            ttk.Button(ligne_documents, text="Choisir dans ce chantier",
+                       command=choisir_dans_chantier).pack(side="left", padx=(0, 8))
         bouton_convertir = ttk.Button(ligne_documents, text="Convertir Word en PDF",
                                       command=convertir_selection_word)
         bouton_convertir.pack(side="left", padx=(0, 8))
-        ttk.Button(ligne_dossier, text="Dossier (ajout manuel)",
+        ttk.Button(ligne_dossier, text="Ouvrir le dossier" if est_offre else "Dossier (ajout manuel)",
                    command=lambda: ouvrir_dossier(dossier_destination())).pack(side="left", padx=(0, 8))
         ttk.Button(ligne_dossier, text="Renommer", command=renommer_selection).pack(side="left", padx=(0, 8))
         ttk.Button(ligne_dossier, text="Supprimer (corbeille)",
                    command=retirer_selection).pack(side="left", padx=(0, 8))
         ttk.Button(ligne_dossier, text="Actualiser", command=rafraichir).pack(side="left")
+        if categorie == "Administratif":
+            bouton_mail = ttk.Button(ligne_dossier, text="Envoyer le dossier par mail",
+                                     command=envoyer_dossier_administratif)
+            bouton_mail.pack(side="left", padx=8)
+            ttk.Label(cadre, text="Mail : tout le dossier est regroupé en un seul PDF, "
+                      "à glisser dans le message Gmail qui s’ouvre.").pack(anchor="w", pady=(6, 0))
         ttk.Button(ligne_dossier, text="Fermer", command=fenetre.destroy).pack(side="right")
 
     def ouvrir_fiches_techniques(self) -> None:
         self._importer_depuis_bibliotheque("Technique")
 
-    def ouvrir_bibliotheque_prix_materiaux(self) -> None:
+    def ouvrir_prix_materiaux_chantier(self) -> None:
+        self.ouvrir_bibliotheque_prix_materiaux()
+
+    def ouvrir_offres_chantier(self, categorie: str) -> None:
+        if categorie not in DOSSIERS_OFFRES:
+            raise ValueError("Catégorie d'offre inconnue.")
+        if not self._nom_chantier_selectionne():
+            return
         try:
+            assurer_dossiers_factures(self._dossier_chantier_selectionne())
+            self._ouvrir_documents_chantier(categorie)
+        except (OSError, ValueError) as erreur:
+            messagebox.showerror("Offres", str(erreur), parent=self)
+
+    def choisir_offre_prix_chantier(self, categorie: str | None = None) -> None:
+        if categorie == DOSSIER_OFFRES_PRIX:
+            categorie = None
+        if categorie is not None and categorie not in DOSSIERS_OFFRES:
+            raise ValueError("Catégorie d'offre inconnue.")
+        nom = self._nom_chantier_selectionne()
+        if not nom:
+            return
+        try:
+            chantier = self._dossier_chantier_selectionne()
             chantiers = dossier_chantiers()
             racine = creer_bibliotheque_prix_materiaux(chantiers.parent)
             importer_offres_materiaux(trouver_offres_materiaux(chantiers), chantiers, racine)
-            ouvrir_dossier(racine)
+            selection = {"chantier": nom, "categorie": categorie}
+            choix = choisir_fichier_bibliotheque(
+                self, f"Bibliothèque des offres de prix — importer dans {nom}",
+                racine, racine, tuple(sorted(EXTENSIONS_OFFRES_PRIX)), dossiers=True,
+                offre_selection=selection)
+            if not choix:
+                return
+            source = Path(choix)
+            source.resolve().relative_to(racine.resolve())
+            categorie = selection["categorie"]
+            if categorie not in DOSSIERS_OFFRES:
+                raise ValueError("Choisissez la catégorie de l'offre dans le chantier.")
+            copier_offre_bibliotheque(source, chantier / categorie)
+            self._ouvrir_documents_chantier(categorie)
         except (OSError, ValueError) as erreur:
-            messagebox.showerror("Prix matériaux", str(erreur), parent=self)
+            messagebox.showerror("Importation", f"Importation impossible :\n{erreur}", parent=self)
+
+    def ouvrir_bibliotheque_prix_materiaux(self) -> None:
+        self.choisir_offre_prix_chantier()
 
     def classer_offres_prix_materiaux(self) -> None:
         try:
@@ -3009,11 +3443,13 @@ class HorizonChantierApp(tk.Tk):
         if not nom_chantier:
             return
         try:
-            chemin = (_selectionner_etat(self._dossier_chantier_selectionne())
+            chemin = (_choisir_etat_avancement(self, self._dossier_chantier_selectionne(), "Ouvrir l’état d’avancement")
                       if motif == "Etat_avancement*.xlsm"
                       else next(self._dossier_chantier_selectionne().glob(motif)))
         except (StopIteration, FileNotFoundError, ValueError) as e:
             messagebox.showerror("Introuvable", str(e) or f"Fichier absent :\n{motif}")
+            return
+        if chemin is None:
             return
         if not self._preparer_ouverture_document(chemin):
             return
@@ -3192,17 +3628,26 @@ class HorizonChantierApp(tk.Tk):
         return confirmation.get()
 
     def sauvegarde_pdf_historique(self) -> bool:
-        chemin = _chemin_classeur_excel_actif() or self.dernier_fichier_excel_ouvert
-        if not chemin or not chemin.exists():
-            messagebox.showwarning(
-                "Sauvegarde PDF Historique",
-                "Aucun fichier Excel ouvert n'a été trouvé."
-            )
-            return False
-        self._memoriser_fichier_excel(chemin, afficher_rappel=False)
-
         try:
-            dossier_chantier = _chantier_root_for_path(chemin)
+            chemin = _chemin_classeur_excel_actif()
+            if not chemin or not chemin.is_file():
+                chemin = self.dernier_fichier_excel_ouvert
+            if not chemin or not chemin.is_file():
+                dossier_chantier = self._dossier_chantier_selectionne()
+                choix = filedialog.askopenfilename(
+                    parent=self, title="Choisir le fichier Excel à sauvegarder en PDF",
+                    initialdir=str(dossier_chantier),
+                    filetypes=[("Fichiers Excel", "*.xlsx *.xlsm *.xls")])
+                if not choix:
+                    return False
+                chemin = Path(choix)
+                if not chemin.is_file() or chemin.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
+                    raise ValueError("Choisissez un fichier Excel existant du chantier.")
+                if not chemin.resolve().is_relative_to(dossier_chantier.resolve()):
+                    raise ValueError("Choisissez un fichier Excel du chantier sélectionné.")
+            else:
+                dossier_chantier = _chantier_root_for_path(chemin)
+            self._memoriser_fichier_excel(chemin, afficher_rappel=False)
             historique = dossier_chantier / "Historique_Sauvegardes"
             historique.mkdir(exist_ok=True)
 
@@ -3249,7 +3694,8 @@ class HorizonChantierApp(tk.Tk):
         tk.Label(
             cadre,
             text=(
-                "Vous allez clôturer l'État d'avancement.\n\n"
+                "Vous allez clôturer l'État d'avancement.\n"
+                + (str(getattr(self, "_etat_a_cloturer", "")) + "\n\n") +
                 "Cette opération effectue la mise à zéro des quantités du mois "
                 "et il sera impossible de revenir à l'état précédent.\n\n"
                 "Une copie datée de l'état sera enregistrée automatiquement "
@@ -3443,9 +3889,6 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(frame_gauche, style="Accueil.TButton", text="🔎 Choisir une fiche pour ce chantier",
                    command=self.choisir_fiche_technique_chantier).pack(fill="x", pady=1)
 
-        ttk.Button(frame_gauche, style="Accueil.TButton", text="Classer les offres reçues",
-                   command=self.classer_offres_prix_materiaux).pack(fill="x", pady=1)
-
         ttk.Button(frame_gauche, style="Accueil.TButton", text="🔴 Dossier Technique du chantier",
                    command=self.ouvrir_technique_chantier).pack(fill="x", pady=1)
 
@@ -3464,7 +3907,7 @@ class HorizonChantierApp(tk.Tk):
             frame_gauche,
             style="Accueil.TButton",
             text="📐 Postes / Métré",
-            command=lambda: self._ouvrir_fichier_chantier("Metre_detaille.pdf")
+            command=self.ouvrir_metre_original
         ).pack(fill="x", pady=1)
 
         ttk.Button(
@@ -3502,16 +3945,24 @@ class HorizonChantierApp(tk.Tk):
         ).pack(fill="x", pady=1)
 
         ttk.Separator(frame_droite).pack(fill="x", pady=5)
-        tk.Label(frame_droite, text="FACTURES", font=("Helvetica", 12, "bold"),
+        tk.Label(frame_droite, text="FACTURES ET OFFRES DE PRIX", font=("Helvetica", 12, "bold"),
                  fg="#0052cc").pack(anchor="w", pady=(2, 2))
         ttk.Separator(frame_droite).pack(fill="x", pady=(0, 4))
+        ttk.Button(frame_droite, style="Accueil.TButton", text="🔴 Dossier Factures du chantier",
+                   command=self.ouvrir_factures_chantier).pack(fill="x", pady=1)
         ttk.Button(frame_droite, style="Accueil.TButton", text="📄 Factures client",
                    command=lambda: self.ouvrir_factures_chantier("Entreprise")).pack(fill="x", pady=1)
-        ttk.Button(frame_droite, style="Accueil.TButton", text="📄 Achats et sous-traitants",
+        ttk.Button(frame_droite, style="Accueil.TButton", text="📄 Factures sous-traitants",
                    command=lambda: self.ouvrir_factures_chantier("Achats_et_sous_traitants")).pack(fill="x", pady=1)
-        ttk.Button(frame_droite, style="Accueil.TButton", text="📄 Achats matériaux",
+        ttk.Button(frame_droite, style="Accueil.TButton", text="📄 Factures matériaux",
                    command=lambda: self.ouvrir_factures_chantier("Achats_materiaux")).pack(fill="x", pady=1)
-        ttk.Button(frame_droite, style="Accueil.TButton", text="📁 Offres de prix matériaux",
+        ttk.Button(frame_droite, style="Accueil.TButton", text="🔎 Offres sous-traitants",
+                   command=lambda: self.ouvrir_offres_chantier("Offres_sous_traitants")).pack(fill="x", pady=1)
+        ttk.Button(frame_droite, style="Accueil.TButton", text="🔎 Offres matériaux",
+                   command=lambda: self.ouvrir_offres_chantier("Offres_materiaux")).pack(fill="x", pady=1)
+        ttk.Button(frame_droite, style="Accueil.TButton", text="🔎 Location de matériel",
+                   command=lambda: self.ouvrir_offres_chantier("Offres_location_materiel")).pack(fill="x", pady=1)
+        ttk.Button(frame_droite, style="Accueil.TButton", text="📁 Offres de prix — bibliothèque générale",
                    command=self.ouvrir_bibliotheque_prix_materiaux).pack(fill="x", pady=1)
 
         ttk.Separator(frame_droite).pack(fill="x", pady=5)
@@ -3557,6 +4008,8 @@ class HorizonChantierApp(tk.Tk):
         ).pack(fill="x", pady=1)
 
         ttk.Button(frame_droite, style="Accueil.TButton", text="🔍 Vérifier PR", command=self.verifier_pr).pack(fill="x", pady=1)
+        ttk.Button(frame_droite, style="Accueil.TButton", text="📊 Synthèse du PR",
+                   command=self.synthese_pr).pack(fill="x", pady=1)
         ttk.Button(frame_droite, style="Accueil.TButton", text="⚙️ Calcul / Reca", command=self.calcul_reca).pack(fill="x", pady=1)
 
         ttk.Separator(frame_droite).pack(fill="x", pady=5)
@@ -3779,6 +4232,9 @@ class HorizonChantierApp(tk.Tk):
 
             ("section", "\n📋 Dossier Administratif du chantier\n"),
             ("texte", "Affiche le même tableau que le dossier Technique : ouvrir, ajouter, actualiser ou fermer.\n"),
+            ("texte", "Envoyer le dossier par mail regroupe toutes les pièces et sous-dossiers dans un seul PDF "
+             "et ouvre Gmail. Glisser le PDF sélectionné dans le message, choisir le destinataire puis envoyer. "
+             "Word et Excel nécessitent les applications correspondantes pour leur conversion.\n"),
 
             ("section", "\n📄 Cahier des charges administratif\n"),
             ("texte", "Ouvre le fichier Cahier_administratif.pdf du chantier.\n"),
@@ -3787,7 +4243,8 @@ class HorizonChantierApp(tk.Tk):
             ("texte", "Ouvre le fichier Cahier_technique.pdf du chantier.\n"),
 
             ("section", "\n📐 Postes / Métré\n"),
-            ("texte", "Ouvre le fichier Metre_detaille.pdf du chantier.\n"),
+            ("texte", "Ouvre l'original enregistré pour le bordereau du chantier ; "
+             "sans bordereau configuré, ouvre Metre_detaille.pdf.\n"),
 
             ("section", "\n🦺 Plan de sécurité (PSS)\n"),
             ("texte", "Ouvre le fichier PSS.pdf du chantier.\n"),
@@ -3822,14 +4279,12 @@ class HorizonChantierApp(tk.Tk):
             ("liste", "❌ Ne pas modifier les formules, les feuilles de bibliothèque ou les listes déroulantes.\n"),
 
             ("section", "\n📖 Cahier technique dans le PR\n"),
-            ("texte", "Dans un PR équipé, les pages du cahier des charges sont intégrées comme images lisibles dans des onglets CSC du même classeur Excel.\n"),
-            ("liste", "✅ Sous la désignation du poste, à droite du numéro d’article, cliquer sur le lien Cahier technique.\n"),
-            ("liste", "✅ Lire les pages dans l’onglet CSC correspondant, faire défiler ou ajuster le zoom Excel si nécessaire.\n"),
-            ("liste", "✅ Cliquer sur Retour au PR en haut de l’onglet pour revenir au poste.\n"),
-            ("texte", "Le lien remplace les longs textes copiés-collés manuellement. Les photos et les saisies du poste sont conservées. Le bouton Cahier des charges technique d’Horizon ouvre toujours le PDF complet séparément.\n"),
-            ("liste", "✅ Préparer et vérifier les correspondances articles/pages pour chaque chantier dans les dossiers de travail, avant transfert sur le partage.\n"),
-            ("liste", "✅ Transférer le classeur complet : les pages et les liens internes restent dans le fichier lors de son déplacement entre Windows et macOS.\n"),
-            ("texte", "Mariemont est équipé. Ce fonctionnement est retenu pour les autres chantiers, mais leur préparation reste à effectuer chantier par chantier ; la reconnaissance et l’intégration automatiques ne sont pas encore disponibles.\n"),
+            ("texte", "Le lien Cahier technique du PR retrouve le cahier chargé dans ce chantier. Vous choisissez vous-même les pages.\n"),
+            ("liste", "✅ Ouvrir le PR depuis Horizon pour activer les liens des postes existants ou ajoutés.\n"),
+            ("liste", "✅ Cliquer sur Cahier technique sous la désignation, puis saisir les pages du lecteur PDF : par exemple 30-32, 35.\n"),
+            ("liste", "✅ Cliquer sur Ouvrir les pages. Le lecteur PDF affiche les pages choisies ; le choix est mémorisé pour cet article.\n"),
+            ("liste", "✅ Recliquer sur le même lien pour modifier les pages. Charger un cahier permet de choisir un autre PDF pour ce chantier.\n"),
+            ("texte", "Le numéro de page est celui du lecteur PDF, à partir de 1, même si le numéro imprimé sur le document est différent. Les choix restent avec le chantier lors de son déplacement.\n"),
 
             ("section", "\n🔍 Vérifier PR\n"),
             ("texte", "Lance le contrôle du Prix de revient enregistré.\n"),
@@ -3925,15 +4380,12 @@ class HorizonChantierApp(tk.Tk):
         contenu_depannage_complet = [
             ("titre", "🔧 DÉPANNAGE\n"),
 
-            ("section", "\n📖 CAHIER TECHNIQUE INTÉGRÉ AU PR\n"),
-            ("texte", "Le lien sous la désignation doit afficher un onglet CSC dans le même classeur. Retour au PR, en haut de cet onglet, ramène au poste.\n"),
-            ("liste", "✅ Si le lien est absent, vérifier que ce PR a été préparé avec les pages intégrées. L’équipement d’un chantier ne prépare pas automatiquement les autres.\n"),
-            ("liste", "✅ Si un lecteur PDF, une recherche de fichier ou une demande d’accès apparaît, vérifier que vous utilisez le lien interne du PR équipé, et non un ancien lien vers un PDF ou le bouton Cahier des charges technique d’Horizon.\n"),
-            ("liste", "✅ Si un lien ne fonctionne plus, vérifier que l’onglet CSC existe et n’a pas été renommé ou supprimé. Noter le numéro d’article pour faire corriger la correspondance.\n"),
-            ("liste", "✅ Si les pages ne correspondent pas au poste, vérifier le numéro d’article et la version du cahier technique. Après modification du PDF source, les pages intégrées doivent être mises à jour : elles ne se rafraîchissent pas automatiquement.\n"),
-            ("liste", "✅ Si le texte paraît trop petit, augmenter le zoom Excel. Les pages sont des images de consultation ; leur texte ne se modifie pas dans les cellules.\n"),
-            ("liste", "✅ Avant toute correction, enregistrer et fermer le PR, puis conserver une copie complète du classeur avec les dernières saisies et photos.\n"),
-            ("danger", "❌ Ne pas supprimer les photos, les onglets CSC ou les formules pour réparer un lien.\n"),
+            ("section", "\n📖 LIENS DU CAHIER DANS LE PR\n"),
+            ("texte", "Le lien ouvre Horizon pour choisir les pages, puis le lecteur PDF pour les consulter.\n"),
+            ("liste", "✅ Si le lien est absent ou ancien, enregistrer et fermer le PR, puis le rouvrir depuis la version à jour d’Horizon.\n"),
+            ("liste", "✅ Si le cahier est absent, cliquer sur Charger un cahier dans la fenêtre des pages.\n"),
+            ("liste", "✅ Après remplacement du PDF, choisir à nouveau les pages : les anciens numéros ne sont pas appliqués automatiquement à la nouvelle version.\n"),
+            ("liste", "✅ Sur un autre poste, démarrer Horizon à jour et sélectionner le bon dossier de chantiers avant d’utiliser les liens.\n"),
 
             ("section", "\n💰 PR (PRIX DE REVIENT) - FORMULES & DÉPANNAGE\n"),
             ("intro", "Cette aide rappelle les formules clés du PR et les points de contrôle à ne jamais casser.\n"),
@@ -4193,7 +4645,9 @@ class HorizonChantierApp(tk.Tk):
             return False
         wb = valeurs = None
         try:
-            chemin = _selectionner_etat(self._dossier_chantier_selectionne())
+            chemin = _choisir_etat_avancement(self, self._dossier_chantier_selectionne(), "Calcul état")
+            if chemin is None:
+                return False
             signature = _signature_excel(chemin)
             wb = load_workbook(chemin, keep_vba=Path(chemin).suffix.lower() == ".xlsm")
             valeurs = load_workbook(chemin, data_only=True)
@@ -4214,14 +4668,17 @@ class HorizonChantierApp(tk.Tk):
                 _fermer_classeur(valeurs)
 
     def mise_a_zero_etat(self):
-        if not self._confirmer_cloture_etat():
-            return
         if not self._chemin_chantier_selectionne():
             messagebox.showwarning("Clôturer état", "Sélectionne un chantier dans la liste.")
             return
         wb = valeurs = None
         try:
-            chemin = _selectionner_etat(self._dossier_chantier_selectionne())
+            chemin = _choisir_etat_avancement(self, self._dossier_chantier_selectionne(), "Clôturer état")
+            if chemin is None:
+                return
+            self._etat_a_cloturer = chemin
+            if not self._confirmer_cloture_etat():
+                return
             signature = _signature_excel(chemin)
             wb = load_workbook(chemin, keep_vba=Path(chemin).suffix.lower() == ".xlsm")
             valeurs = load_workbook(chemin, data_only=True)
@@ -4302,6 +4759,22 @@ class HorizonChantierApp(tk.Tk):
                 wb.close()
             if wb_formules is not None:
                 wb_formules.close()
+
+    def synthese_pr(self):
+        from synthese_pr import lire_synthese_pr, generer_pdf_synthese
+        nom = self._nom_chantier_selectionne()
+        if not nom:
+            return
+        try:
+            chantier = self._dossier_chantier_selectionne()
+            pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
+            resultat = lire_synthese_pr(pr)
+            with tempfile.NamedTemporaryFile(prefix="Synthese_PR_", suffix=".pdf", delete=False) as fichier:
+                destination = Path(fichier.name)
+            generer_pdf_synthese(resultat, destination, nom, dossier_base() / "logo_jt_bati.png")
+            ouvrir_chemin(destination)
+        except (OSError, ValueError) as erreur:
+            messagebox.showerror("Synthèse du PR", str(erreur), parent=self)
 
     def pilotage_chantier(self):
         import os
@@ -4419,6 +4892,14 @@ class HorizonChantierApp(tk.Tk):
             col_cumule = _col_etat_cumule if _ligne_etat_cumule is not None else col_execute
             total_realise = _montant_a_droite(ws, ligne_cumule, col_cumule, nombre, requis=True)
             total_mois = _montant_a_droite(ws, ligne_mois, col_mois, nombre, requis=True)
+            from options_pilotage import lire_options_pilotage
+            options = lire_options_pilotage(chemin, ws, {
+                "marche": (ligne_soumission, col_soumission),
+                "cumule": (ligne_cumule, col_cumule),
+                "mois": (ligne_mois, col_mois),
+            })
+            total_realise += options["ajout_cumule"]
+            total_mois += options["ajout_mois"]
         except ValueError as erreur:
             wb.close()
             messagebox.showerror("Pilotage", str(erreur))
@@ -4449,7 +4930,7 @@ class HorizonChantierApp(tk.Tk):
                     nombre,
                 )
                 wb_avenants.close()
-        total_marche = montant_soumission + avenants_plus - avenants_moins
+        total_marche = montant_soumission + avenants_plus - avenants_moins + options["ajout_marche"]
 
         print("avenants_plus =", avenants_plus)
         print("avenants_moins =", avenants_moins)
@@ -4470,6 +4951,12 @@ class HorizonChantierApp(tk.Tk):
             montant_soumission, total_marche, production_cumulee)
         montant_ecart_affiche = (f"{montant_ecart_marche:+,.2f} €" if reste_a_facturer < 0
                                 else f"{montant_ecart_marche:,.2f} €")
+        ligne_options = (f"\n    Options portées dans l’état     : {options['marche']:,.2f} €"
+                         if options["presentes"] else "")
+        ligne_options_mois = (f"\n    Dont options du mois            : {options['mois']:,.2f} €"
+                              if options["presentes"] else "")
+        ligne_options_cumule = (f"\n    Dont options cumulées           : {options['cumule']:,.2f} €"
+                                if options["presentes"] else "")
 
         texte_popup = f"""PILOTAGE CHANTIER
 
@@ -4477,14 +4964,14 @@ class HorizonChantierApp(tk.Tk):
     Chantier : {nom_chantier}
     Date     : {date_du_jour}
 
-    Montant soumission              : {montant_soumission:,.2f} €
+    Montant soumission              : {montant_soumission:,.2f} €{ligne_options}
     Avenants cumulés en plus        : {avenants_plus:,.2f} €
     Avenants cumulés en moins       : {avenants_moins:,.2f} €
     Marché total                    : {total_marche:,.2f} €
-    Réalisé du mois                 : {realise_mois:,.2f} €
+    Réalisé du mois                 : {realise_mois:,.2f} €{ligne_options_mois}
     Révision renseignée             : {revision:,.2f} €
     Production du mois              : {production_mois:,.2f} €
-    Réalisé cumulé                  : {realise_cumule:,.2f} €
+    Réalisé cumulé                  : {realise_cumule:,.2f} €{ligne_options_cumule}
     Production cumulée              : {production_cumulee:,.2f} €
     {libelle_ecart_marche} : {montant_ecart_affiche}
     Écart au marché total           : {ecart_marche_texte}
@@ -4699,6 +5186,8 @@ class HorizonChantierApp(tk.Tk):
         bloc_1 = Table([
             ["CONSTRUCTION", ""],
             [Paragraph("Montant soumission", style_libelle), Paragraph(f"{montant_soumission:,.2f} €", style_valeur)],
+            *([[Paragraph("Options portées dans l’état", style_libelle),
+                Paragraph(f"{options['marche']:,.2f} €", style_valeur)]] if options["presentes"] else []),
             [Paragraph("+ Avenants cumulés en plus", style_libelle), Paragraph(f"{avenants_plus:,.2f} €", style_valeur)],
             [Paragraph("- Avenants cumulés en moins", style_libelle), Paragraph(f"{avenants_moins:,.2f} €", style_valeur)],
             [Paragraph("= Marché total", style_libelle), Paragraph(f"{total_marche:,.2f} €", style_valeur)],
@@ -4719,16 +5208,20 @@ class HorizonChantierApp(tk.Tk):
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ("TOPPADDING", (0, 0), (-1, -1), 2.5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-            ("BACKGROUND", (0, 4), (1, 4), colors.HexColor("#FFF2CC")),
-            ("FONTNAME", (0, 4), (1, 4), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -1), (1, -1), colors.HexColor("#FFF2CC")),
+            ("FONTNAME", (0, -1), (1, -1), "Helvetica-Bold"),
         ]))
 
         bloc_2 = Table([
             ["RÉALISÉ", ""],
             [Paragraph("Réalisé du mois", style_libelle), Paragraph(f"{realise_mois:,.2f} €", style_valeur)],
+            *([[Paragraph("Dont options du mois", style_libelle),
+                Paragraph(f"{options['mois']:,.2f} €", style_valeur)]] if options["presentes"] else []),
             [Paragraph("+ Révision renseignée", style_libelle), Paragraph(f"{revision:,.2f} €", style_valeur)],
             [Paragraph("= Production du mois", style_libelle), Paragraph(f"{production_mois:,.2f} €", style_valeur)],
             [Paragraph("Réalisé cumulé", style_libelle), Paragraph(f"{realise_cumule:,.2f} €", style_valeur)],
+            *([[Paragraph("Dont options cumulées", style_libelle),
+                Paragraph(f"{options['cumule']:,.2f} €", style_valeur)]] if options["presentes"] else []),
             [Paragraph("= Production cumulée", style_libelle), Paragraph(f"{production_cumulee:,.2f} €", style_valeur)],
         ], colWidths=largeur_blocs_gauche)
         bloc_2.hAlign = "CENTER"
@@ -4747,10 +5240,12 @@ class HorizonChantierApp(tk.Tk):
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ("TOPPADDING", (0, 0), (-1, -1), 2.5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-            ("BACKGROUND", (0, 3), (1, 3), colors.HexColor("#FFF2CC")),
-            ("FONTNAME", (0, 3), (1, 3), "Helvetica-Bold"),
-            ("BACKGROUND", (0, 5), (1, 5), colors.HexColor("#FFF2CC")),
-            ("FONTNAME", (0, 5), (1, 5), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 4 if options["presentes"] else 3),
+             (1, 4 if options["presentes"] else 3), colors.HexColor("#FFF2CC")),
+            ("FONTNAME", (0, 4 if options["presentes"] else 3),
+             (1, 4 if options["presentes"] else 3), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -1), (1, -1), colors.HexColor("#FFF2CC")),
+            ("FONTNAME", (0, -1), (1, -1), "Helvetica-Bold"),
         ]))
 
         bloc_3 = Table([

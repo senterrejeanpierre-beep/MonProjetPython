@@ -14,7 +14,8 @@ class TestCreationChantier(unittest.TestCase):
         self.modeles = self.base / 'Modele'
         self.modeles.mkdir()
         (self.modeles / 'Etat_avancement_02.xlsm').write_bytes(b'ancien modele')
-        (self.modeles / 'prix_de_revient model.xlsx').write_bytes(b'prix')
+        from openpyxl import Workbook
+        Workbook().save(self.modeles / 'prix_de_revient model.xlsx')
         (self.modeles / 'Planning_soumission.xlsx').write_bytes(b'planning soumission')
 
     def test_reprise_dossier_vide_et_documents(self):
@@ -27,7 +28,8 @@ class TestCreationChantier(unittest.TestCase):
         (self.modeles / 'Factures/facture_autre_chantier.pdf').write_bytes(b'prive')
         resultat = _creer_documents_chantier(self.base, 'Chantier', {'type_etat': 'Modèle actuel'})
         self.assertTrue(resultat.is_file())
-        self.assertEqual((self.base / 'Chantier/data/prix_de_revient.xlsx').read_bytes(), b'prix')
+        self.assertEqual((self.base / 'Chantier/data/prix_de_revient.xlsx').read_bytes(),
+                         (self.modeles / 'prix_de_revient model.xlsx').read_bytes())
         self.assertEqual((self.base / 'Chantier/Planning_soumission.xlsx').read_bytes(), b'planning soumission')
         self.assertEqual((self.base / 'Chantier/Etat_avancement_02.xlsm').read_bytes(), b'ancien modele')
         self.assertTrue((self.base / 'Chantier/Documents_installation').is_dir())

@@ -1,0 +1,4 @@
+{
+  "extraPaths": ["./_vendor"],
+  "typeCheckingMode": "off"
+}

@@ -28,9 +28,13 @@ class ImportJoursPlanning(unittest.TestCase):
             wb.active.title = 'PlanningProjet'
             wb.active['B15'] = 'Ancien chantier'
             wb.active['B22'] = 'Ancienne phase'
+            # Cellules présentes et formatées dans le modèle réel, même lorsqu'elles sont vides.
+            from openpyxl.styles import Alignment
+            for ref in ('F22', 'G22'):
+                wb.active[ref].alignment = Alignment(horizontal='right')
             for ligne in range(23, 63):
                 for col in 'BCEFG':
-                    wb.active[f'{col}{ligne}'] = None
+                    wb.active[f'{col}{ligne}'].alignment = Alignment(horizontal='left')
             wb.active['G23'] = '=F23-E23+1'
             wb.active['B23'].hyperlink = 'https://example.invalid/document'
             wb.create_sheet('À propos de')['A1'] = 'Texte conservé'
@@ -55,6 +59,8 @@ class ImportJoursPlanning(unittest.TestCase):
             self.assertEqual(wb['PlanningProjet']['E23'].value, '=Début_Projet+1')
             self.assertEqual(wb['PlanningProjet']['F23'].value, '=E23+2.048')
             self.assertEqual(wb['PlanningProjet']['G23'].value, '=F23-E23+1')
+            self.assertEqual(wb['PlanningProjet']['B22'].value, 'Délai final (jours)')
+            self.assertIn('MAX(F23:F62)', wb['PlanningProjet']['F22'].value)
             self.assertEqual(wb['PlanningProjet']['B23'].hyperlink.target,
                              'https://example.invalid/document')
             wb['Postes PR']['D2'] = 4

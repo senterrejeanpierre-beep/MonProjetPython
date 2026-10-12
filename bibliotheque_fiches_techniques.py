@@ -17,6 +17,22 @@ CLASSEE = "Bibliotheque_Technique"
 ANCIENNES_CLASSEES = ("FICHES TECHNIQUES CLASSEES", "Bibliothèque Technique", "Bibliotheque_technique")
 EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ods", ".odt"}
 ORDRE_GROUPES = ("Bâtiment", "Échafaudage", "Pierre", "Peinture", "Acier", "Toiture", "Autres")
+DOSSIERS_COMPLEMENTAIRES = (
+    "Hydrofuge", "Dévitalisation et nettoyage", "Traitement de façade",
+)
+
+
+def _assurer_dossiers_complementaires(bibliotheque: Path) -> None:
+    """Rend les rubriques disponibles dans le sélecteur commun, même vides."""
+    ancien = bibliotheque / "Nettoyage façade et dévégétalisation"
+    nouveau = bibliotheque / "Dévitalisation et nettoyage"
+    if ancien.is_dir():
+        if not nouveau.exists():
+            ancien.rename(nouveau)
+        elif not any(ancien.iterdir()):
+            ancien.rmdir()
+    for nom in DOSSIERS_COMPLEMENTAIRES:
+        (bibliotheque / nom).mkdir(exist_ok=True)
 
 
 def _sans_accents(texte: str) -> str:
@@ -151,9 +167,11 @@ def creer_bibliotheque_classee(base: Path, alimenter_depuis_source: bool = False
             if dossier.name != CLASSEE and dossier.samefile(sortie):
                 dossier.rename(sortie)
                 break
+        _assurer_dossiers_complementaires(sortie)
         return sortie, 0, 0
     if not alimenter_depuis_source or not source.is_dir():
         sortie.mkdir()
+        _assurer_dossiers_complementaires(sortie)
         return sortie, 0, 0
     groupes = defaultdict(list)
     for document in _documents(source):
@@ -162,6 +180,7 @@ def creer_bibliotheque_classee(base: Path, alimenter_depuis_source: bool = False
     with tempfile.TemporaryDirectory(prefix=".fiches_classees_", dir=base) as tmp:
         preparation = Path(tmp) / CLASSEE
         preparation.mkdir()
+        _assurer_dossiers_complementaires(preparation)
         wb = Workbook()
         ws = wb.active
         ws.title = "Catégories"

@@ -8,11 +8,57 @@ from zipfile import ZipFile
 
 from bibliotheque_administrative import (DOSSIERS_CATEGORIES, classer_bibliotheque_cinq_dossiers,
                                          creer_bibliotheque_administrative,
-                                         copier_documents_administratifs, importer_dans_bibliotheque)
+                                         copier_documents_administratifs, importer_dans_bibliotheque,
+                                         ranger_copies_secours, DOSSIER_COPIES_SECOURS)
 from main import HorizonChantierApp, mettre_fichier_corbeille
 
 
 class BibliothequeAdministrativeTests(unittest.TestCase):
+    def test_copies_secours_capture_conservees_hors_documents_courants(self):
+        with TemporaryDirectory() as temp:
+            for chantier in ('004_Mariemont', '006_Nouveau chantier déplacé'):
+                dossier = Path(temp) / chantier / 'Administratif'
+                noms = ('Liste de références JT BATI Mariemont',
+                        'Coordonnée concernant la fourniture des copeaux JT BATI Mariemont')
+                for nom in noms:
+                    (dossier / nom).mkdir(parents=True)
+                    (dossier / f'{nom}.docx').write_bytes(b'original courant')
+                    (dossier / nom / f'Copie de secours de {nom}.docx').write_bytes(b'secours')
+                (dossier / 'Liste copie.docx').write_bytes(b'copie volontaire')
+                self.assertEqual(ranger_copies_secours(dossier), 2)
+                self.assertEqual(ranger_copies_secours(dossier), 0)
+                for nom in noms:
+                    relatif = Path(nom) / f'Copie de secours de {nom}.docx'
+                    self.assertFalse((dossier / relatif).exists())
+                    self.assertEqual((dossier / DOSSIER_COPIES_SECOURS / relatif).read_bytes(), b'secours')
+                    self.assertEqual((dossier / f'{nom}.docx').read_bytes(), b'original courant')
+                self.assertEqual((dossier / 'Liste copie.docx').read_bytes(), b'copie volontaire')
+
+    def test_nouvelles_versions_secours_et_conflits_sans_ecrasement(self):
+        with TemporaryDirectory() as temp:
+            dossier = Path(temp)
+            nom = 'Copie de secours de Liste.docx'
+            source = dossier / nom
+            for contenu in (b'version 1', b'version 2', b'version 2'):
+                source.write_bytes(contenu)
+                self.assertEqual(ranger_copies_secours(dossier), 1)
+            self.assertEqual(sorted(p.read_bytes() for p in (dossier / DOSSIER_COPIES_SECOURS).iterdir()),
+                             [b'version 1', b'version 2'])
+            (dossier / 'Liste.WBK').write_bytes(b'Word Windows')
+            self.assertEqual(ranger_copies_secours(dossier), 1)
+            self.assertEqual((dossier / DOSSIER_COPIES_SECOURS / 'Liste.WBK').read_bytes(), b'Word Windows')
+
+    def test_secours_non_supprime_si_copie_echoue(self):
+        with TemporaryDirectory() as temp:
+            dossier = Path(temp)
+            source = dossier / 'Copie de secours de Liste.docx'
+            source.write_bytes(b'original')
+            with patch('bibliotheque_administrative.shutil.copyfileobj', side_effect=OSError('Partage indisponible')):
+                with self.assertRaises(OSError):
+                    ranger_copies_secours(dossier)
+            self.assertEqual(source.read_bytes(), b'original')
+            self.assertEqual(list((dossier / DOSSIER_COPIES_SECOURS).iterdir()), [])
+
     def test_corbeille_limitee_aux_fichiers_du_dossier(self):
         with TemporaryDirectory() as temp:
             chantier = Path(temp) / "Chantier/Administratif"

@@ -1,6 +1,7 @@
 """Bibliothèque administrative commune, plate et portable entre macOS et Windows."""
 
 import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -11,6 +12,7 @@ from zipfile import ZipFile
 
 
 DOSSIER_BIBLIOTHEQUE = "Bibliotheque_administrative"
+DOSSIER_COPIES_SECOURS = "Copies_de_secours"
 DOSSIER_COMMUN = "Document prêt/Dossier à envoyer/JT BATI"
 DOSSIERS_COMMUNS = (
     "Liste du personnel et diplôme",
@@ -43,6 +45,49 @@ def _nom_normalise(nom: str) -> str:
 def _sans_accents(nom: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", nom.casefold())
                    if not unicodedata.combining(c))
+
+
+def dans_copies_secours(relatif: Path) -> bool:
+    return any(_nom_normalise(part) == DOSSIER_COPIES_SECOURS.casefold()
+               for part in Path(relatif).parts)
+
+
+def est_copie_secours(relatif: Path) -> bool:
+    chemin = Path(relatif)
+    return (dans_copies_secours(chemin) or chemin.suffix.casefold() == ".wbk"
+            or re.match(r"^copie de secours(?:\s|[._-]|$)", _nom_normalise(chemin.name)) is not None)
+
+
+def ranger_copies_secours(dossier: Path) -> int:
+    """Isole les sauvegardes Word en préservant les versions et les sous-dossiers."""
+    dossier = Path(dossier)
+    if not dossier.is_dir() or dossier.is_symlink():
+        raise ValueError("Dossier administratif introuvable ou non valide.")
+    sources = []
+    def erreur_parcours(erreur):
+        raise erreur
+    for parent, dossiers, noms in os.walk(dossier, followlinks=False, onerror=erreur_parcours):
+        dossiers[:] = [nom for nom in dossiers
+                       if not nom.startswith((".", "~$"))
+                       and not dans_copies_secours(Path(nom))
+                       and not (Path(parent) / nom).is_symlink()]
+        sources.extend(Path(parent) / nom for nom in noms
+                       if est_copie_secours(Path(nom)) and not (Path(parent) / nom).is_symlink())
+    nombre = 0
+    for source in sorted(sources):
+        relatif = source.relative_to(dossier)
+        destination = dossier
+        for part in (DOSSIER_COPIES_SECOURS, *relatif.parent.parts):
+            destination = _chemin_existant(destination, part) or destination / part
+            if destination.is_symlink():
+                raise ValueError(f"Le dossier de copies de secours est un lien : {destination}")
+            destination.mkdir(exist_ok=True)
+        copie, _ = _copier_sans_remplacer(source, destination, source.name)
+        if copie.is_symlink() or hashlib.sha256(source.read_bytes()).digest() != hashlib.sha256(copie.read_bytes()).digest():
+            raise ValueError(f"La copie de secours a changé pendant son rangement : {source.name}")
+        source.unlink()
+        nombre += 1
+    return nombre
 
 
 def categorie_document(fichier: Path) -> str:

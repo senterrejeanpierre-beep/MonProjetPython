@@ -80,7 +80,11 @@ def changements_soumission(archive: ZipFile, nom='', client='', adresse='', post
             raise ValueError('Le planning actuel contient 40 lignes de tâches ; le PR en contient davantage.')
         if any(jours is None for _, _, jours in postes):
             raise ValueError('Certains postes du PR n’ont pas de résultat de jours enregistré en G.')
-        feuille = _mettre_texte(feuille, 'B22', '')
+        feuille = _mettre_texte(feuille, 'B22', 'Délai final (jours)')
+        feuille = _mettre_formule(feuille, 'F22',
+            'IF(COUNTA(B23:B62)=0,"",IF(COUNT(E23:E62)<COUNTA(B23:B62),'
+            '"À compléter",MAX(F23:F62)))')
+        feuille = _mettre_formule(feuille, 'G22', '')
         for ligne in range(PREMIERE_LIGNE, DERNIERE_LIGNE + 1):
             position = ligne - PREMIERE_LIGNE
             if position < len(postes):

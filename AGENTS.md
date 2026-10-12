@@ -1,3 +1,14 @@
+# Règle générale stricte et permanente : périmètre demandé
+- Limiter toute intervention à ce que l'utilisateur demande explicitement. Rien d'autre.
+- Ne pas ajouter de fonctionnalité, de modification visuelle, de refonte ou d'amélioration non demandée, même jugée utile.
+- Cette règle s'applique à chaque intervention et entre les sessions, sans que l'utilisateur ait à la répéter.
+
+# Règle stricte permanente : simplicité métier
+- Horizon Chantier est un logiciel métier : ne pas compliquer son utilisation. Répondre au besoin demandé par la solution la plus simple et directe qui le satisfait réellement.
+- Ne pas multiplier les feuilles, colonnes, fenêtres, options ou manipulations pour résoudre une difficulté technique. La complexité technique ne doit pas être reportée sur l'utilisateur.
+- Conserver le fonctionnement métier convenu et les choix déjà exprimés. Ne pas faire répéter l'utilisateur ni remplacer sa demande par un autre fonctionnement plus facile à développer.
+- Limiter chaque intervention au nécessaire et vérifier le résultat sur le cas d'usage demandé avant d'annoncer que c'est terminé. Un test technique réussi ne suffit pas à prouver que l'usage attendu est satisfait.
+
 # Interdiction permanente : indépendance des logiciels
 - Règle absolue : intervenir uniquement sur ce que l'utilisateur demande explicitement. Ne rien ajouter d'autre, ne prendre aucune initiative fonctionnelle ou visuelle et ne modifier ni les polices ni la présentation sans demande explicite. Horizon Chantier est un logiciel métier et doit conserver ce caractère.
 - Le dossier du projet courant est une frontière stricte pour toute intervention. Ne jamais consulter, parcourir ou modifier les dossiers des autres logiciels de l'utilisateur.

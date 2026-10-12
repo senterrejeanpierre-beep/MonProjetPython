@@ -1,13 +1,55 @@
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from main import copier_fichier_importe, convertir_word_en_pdf_chantier
+from main import copier_fichier_importe, convertir_word_en_pdf_chantier, HorizonChantierApp
 
 
 class ImportDocumentsChantierTests(unittest.TestCase):
+    def test_metre_ouvre_original_configure_sans_choix_parmi_versions_ou_lots(self):
+        with tempfile.TemporaryDirectory() as temporaire:
+            for nom_chantier, original in (
+                    ('004_Mariemont', '2420_MARIEMONT_METRE RECAP_LOT 1-MAC_250924.xlsx'),
+                    ('006_Nouveau chantier déplacé', 'Métré Lot 4 dernière publication.xlsx')):
+                dossier = Path(temporaire) / nom_chantier
+                dossier.mkdir()
+                copie = Path(original).stem + '_avancement.xlsx'
+                for nom in (original, copie, 'Metre_detaille.pdf',
+                            '2420_MARIEMONT_METRE RECAP_LOT 1-MAC_250917.xlsx',
+                            '2420_MARIEMONT_METRE RECAP_LOT 2-BETON_250924.xlsx',
+                            '2420_MARIEMONT_METRE RECAP_LOT 3-FER_250917.xlsx'):
+                    (dossier / nom).write_bytes(nom.encode())
+                (dossier / 'bordereau_public.json').write_text(
+                    json.dumps({'original': original, 'copie': copie}), encoding='utf-8')
+                avant = {p.name: p.read_bytes() for p in dossier.iterdir()}
+                app = SimpleNamespace(_nom_chantier_selectionne=lambda: nom_chantier,
+                                      _dossier_chantier_selectionne=lambda: dossier,
+                                      _preparer_ouverture_document=lambda p: True,
+                                      _doit_rappeler_pdf_historique=lambda p: False)
+                app._ouvrir_fichier_chantier = lambda nom: HorizonChantierApp._ouvrir_fichier_chantier(app, nom)
+                with patch('main.ouvrir_chemin') as ouvrir, patch('main.messagebox.showerror') as erreur:
+                    HorizonChantierApp.ouvrir_metre_original(app)
+                    ouvrir.assert_called_once_with(dossier / original)
+                    erreur.assert_not_called()
+                self.assertEqual({p.name: p.read_bytes() for p in dossier.iterdir()}, avant)
+                # Un original manquant ne doit jamais ouvrir un autre lot ou une ancienne version.
+                (dossier / original).unlink()
+                with patch('main.ouvrir_chemin') as ouvrir, patch('main.messagebox.showerror') as erreur:
+                    HorizonChantierApp.ouvrir_metre_original(app)
+                    ouvrir.assert_not_called()
+                    erreur.assert_called_once()
+
+    def test_metre_sans_configuration_conserve_acces_pdf(self):
+        with tempfile.TemporaryDirectory() as temporaire:
+            app = SimpleNamespace(_nom_chantier_selectionne=lambda: 'Chantier',
+                                  _dossier_chantier_selectionne=lambda: Path(temporaire),
+                                  _ouvrir_fichier_chantier=Mock())
+            HorizonChantierApp.ouvrir_metre_original(app)
+            app._ouvrir_fichier_chantier.assert_called_once_with('Metre_detaille.pdf')
+
     def test_import_reutilise_le_dossier_et_preserve_les_fichiers(self):
         with tempfile.TemporaryDirectory() as temporaire:
             base = Path(temporaire)

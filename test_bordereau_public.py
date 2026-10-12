@@ -8,6 +8,82 @@ from bordereau_public import preparer, exporter_prix, feuille, habiller_avanceme
 from main import _corriger_moins_etat_public, _selectionner_etat, _recalculer_etat, _reporter_quantites_cloture
 
 class BordereauPublic(unittest.TestCase):
+    def creer_indice_c_et_copie(self, dossier):
+        original, copie = dossier / 'indice_C.xlsx', dossier / 'avancement.xlsx'
+        w = Workbook(); s = w.active; s.title = 'LOT 1 - IND. C'
+        for adresse, valeur in {'A1': 'N°', 'B1': 'DÉSIGNATION', 'C1': 'MESURAGE',
+                                'D1': 'UNITÉ', 'J1': 'QUANTITÉ', 'K1': 'PRIX UNITAIRES',
+                                'L1': 'PRIX', 'M1': 'PRIX OPTIONS'}.items():
+            s[adresse] = valeur
+        for r, code, libelle, quantite in ((13, '01', 'Poste', 12), (18, '02', 'OPTION 1 : Poste', 3)):
+            for col, valeur in {'A': code, 'B': libelle, 'C': 'QP', 'D': 'M²',
+                                'J': quantite, 'K': 0, 'L': f'=J{r}*K{r}',
+                                'M': f'=L{r}' if r == 18 else None}.items():
+                s[f'{col}{r}'] = valeur
+        s['K13'] = None  # Cellule vide mais présente avec son style, XML autofermant.
+        s['K13'].number_format = '#,##0.00'
+        s['B20'] = 'Note officielle conservée'
+        w.save(original); w.close()
+        w = Workbook(); s = w.active
+        s['B1'], s['K1'], s['L1'] = 'N°', 'QUANTITÉ', 'PRIX UNITAIRES'
+        # Ordre et lignes différents ; les quantités officielles font foi dans l'export.
+        for r, code, libelle, prix in ((4, '02', 'OPTION 1 : Poste', 0), (9, '01', 'Poste', 125.75)):
+            for col, valeur in {'B': code, 'C': libelle, 'D': 'QP', 'E': 'M²', 'K': 999, 'L': prix}.items():
+                s[f'{col}{r}'] = valeur
+        w.save(copie); w.close()
+        return original, copie
+
+    def test_export_indice_c_par_article_et_preservation_du_document_officiel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            original, copie = self.creer_indice_c_et_copie(d)
+            avant = original.read_bytes()
+            sortie = d / 'export.xlsx'
+            self.assertEqual(exporter_prix(original, copie, sortie, hashlib.sha256(avant).hexdigest()), 2)
+            self.assertEqual(original.read_bytes(), avant)
+            a, b = load_workbook(original), load_workbook(sortie)
+            try:
+                s = b.active
+                self.assertEqual(s['K13'].value, 125.75)
+                self.assertEqual(s['K18'].value, 0)
+                self.assertEqual(s['J13'].value, 12)
+                self.assertEqual(s['M18'].value, '=L18')
+                for row in a.active:
+                    for cellule in row:
+                        cible = s[cellule.coordinate]
+                        if cellule.coordinate not in {'K13', 'K18'}:
+                            self.assertEqual(cellule.value, cible.value)
+                        self.assertEqual(cellule._style, cible._style)
+            finally:
+                a.close(); b.close()
+            with zipfile.ZipFile(original) as a, zipfile.ZipFile(sortie) as b:
+                self.assertEqual(a.namelist(), b.namelist())
+                for nom in a.namelist():
+                    if nom != 'xl/worksheets/sheet1.xml':
+                        self.assertEqual(a.read(nom), b.read(nom))
+
+    def test_indice_c_refuse_les_correspondances_ou_prix_invalides(self):
+        for cellule, valeur in (('B4', '01'), ('B4', 'inconnu'), ('E9', 'M³'),
+                                ('C9', 'Autre poste'), ('L9', None), ('L9', '=1+2'), ('L9', True)):
+            with self.subTest(cellule=cellule, valeur=valeur), tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                original, copie = self.creer_indice_c_et_copie(d)
+                w = load_workbook(copie); w.active[cellule] = valeur; w.save(copie); w.close()
+                avant = original.read_bytes()
+                with self.assertRaises(ValueError):
+                    exporter_prix(original, copie, d / 'export.xlsx', hashlib.sha256(avant).hexdigest())
+                self.assertFalse((d / 'export.xlsx').exists())
+                self.assertEqual(original.read_bytes(), avant)
+
+    def test_indice_c_ne_remplace_pas_une_formule_de_prix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            original, copie = self.creer_indice_c_et_copie(d)
+            w = load_workbook(original); w.active['K13'] = '=1+2'; w.save(original); w.close()
+            with self.assertRaisesRegex(ValueError, 'Formule protégée en K13'):
+                exporter_prix(original, copie, d / 'export.xlsx', hashlib.sha256(original.read_bytes()).hexdigest())
+            self.assertFalse((d / 'export.xlsx').exists())
+
     def test_ancienne_synthese_publique_retire_moins_sans_effacer_saisie(self):
         ws = Workbook().active
         ws["P20"] = "Total des avenants cumulé"

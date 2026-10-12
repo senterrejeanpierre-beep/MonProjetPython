@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from factures_chantier import DOSSIERS_FACTURES, preparer_dossiers_factures
+from factures_chantier import DOSSIERS_FACTURES, DOSSIERS_OFFRES, preparer_dossiers_factures
 from main import HorizonChantierApp
 
 
@@ -25,6 +25,7 @@ class ClassementFacturesTests(unittest.TestCase):
             self.assertEqual(len(prepares), 5)
             for dossier in prepares:
                 self.assertTrue(all((dossier / nom).is_dir() for nom in DOSSIERS_FACTURES))
+                self.assertTrue(all((dossier.parent / nom).is_dir() for nom in DOSSIERS_OFFRES))
             for nom in ('001_Chapelette', '002_Saint-Symphorien',
                         '003_Frederic_melin urgence', '004_Mariemont'):
                 self.assertEqual((base / nom / 'Factures' / 'ancien.pdf').read_bytes(), nom.encode())

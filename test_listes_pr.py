@@ -84,7 +84,7 @@ class ListesPR(unittest.TestCase):
             data = chantier / 'data'
             data.mkdir()
             path = data / 'prix_de_revient.xlsx'
-            path.write_bytes(b'contenu de test')
+            Workbook().save(path)
             with patch('main.ouvrir_chemin') as ouvrir, patch(
                 'main.reparer_listes_pr', side_effect=PermissionError('fichier inaccessible')
             ):

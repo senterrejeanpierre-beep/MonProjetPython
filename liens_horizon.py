@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote, unquote
 
 MARQUEUR = '.horizon_documents.json'
 SCHEMA = 'horizonchantier'
@@ -44,6 +44,28 @@ def lien_poste(chantier, numero):
     return f'{SCHEMA}://documents/{identifier(chantier)}/{int(numero):03d}'
 
 
+def lien_cahier(chantier, article):
+    article = str(article).strip()
+    if not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z. _-]{0,99}', article):
+        raise ValueError('Numéro d’article invalide.')
+    return f'{SCHEMA}://cahier/{identifier(chantier)}/{quote(article, safe="")}'
+
+
+def analyser_cahier(lien):
+    url = urlsplit(lien)
+    match = re.fullmatch(r'/([A-Za-z0-9_-]{24,64})/([^/]+)', url.path)
+    if url.scheme != SCHEMA or url.netloc != 'cahier' or not match or url.query or url.fragment:
+        raise ValueError('Lien de cahier Horizon invalide.')
+    article = unquote(match[2])
+    if not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z. _-]{0,99}', article):
+        raise ValueError('Numéro d’article invalide.')
+    return match[1], article
+
+
+def est_lien_cahier(lien):
+    return urlsplit(lien).netloc == 'cahier'
+
+
 def analyser(lien):
     url = urlsplit(lien)
     correspondance = re.fullmatch(r'/([A-Za-z0-9_-]{24,64})/(\d{3,6})', url.path)
@@ -53,7 +75,7 @@ def analyser(lien):
 
 
 def resoudre(base, lien):
-    identifiant, numero = analyser(lien)
+    identifiant, numero = analyser_cahier(lien) if est_lien_cahier(lien) else analyser(lien)
     candidats = []
     for p in Path(base).glob('*/' + MARQUEUR):
         try:
@@ -67,7 +89,7 @@ def resoudre(base, lien):
 
 
 def deposer(lien):
-    analyser(lien)
+    (analyser_cahier if est_lien_cahier(lien) else analyser)(lien)
     dossier = dossier_local()
     dossier.mkdir(parents=True, exist_ok=True)
     nom = secrets.token_hex(12)
@@ -106,7 +128,7 @@ def installer(main):
     local = dossier_local()
     local.mkdir(parents=True, exist_ok=True)
     empreinte = local / 'installation.txt'
-    valeur = '3:' + json.dumps(commande)
+    valeur = '4:' + json.dumps(commande)
     if sys.platform == 'win32':
         import winreg
         cle = 'Software\\Classes\\' + SCHEMA
